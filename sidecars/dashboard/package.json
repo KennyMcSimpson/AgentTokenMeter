@@ -1,0 +1,6 @@
+{
+  "name": "agent_token_meter_dashboard",
+  "version": "2.0.0",
+  "type": "module",
+  "description": "Antigravity Auxiliary Pane sidecar wrapper for Agent Token Meter"
+}

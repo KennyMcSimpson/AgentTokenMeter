@@ -1,0 +1,37 @@
+{
+  "name": "agent-token-meter",
+  "version": "2.0.0",
+  "description": "AgentTokenMeter: Zero-dependency local token usage, prompt cache analytics, and multi-provider official API cost tracker for Antigravity, Claude Code, and Codex.",
+  "type": "module",
+  "license": "MIT",
+  "author": "KennyMcSimpson",
+  "homepage": "https://github.com/KennyMcSimpson/AgentTokenMeter#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/KennyMcSimpson/AgentTokenMeter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KennyMcSimpson/AgentTokenMeter/issues"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "bin": {
+    "agent-token-meter": "./bin/token-meter.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "serve": "node ./bin/token-meter.mjs serve",
+    "summary": "node ./bin/token-meter.mjs summary"
+  },
+  "keywords": [
+    "antigravity",
+    "claude-code",
+    "codex",
+    "token-usage",
+    "cost-tracker",
+    "gemini",
+    "anthropic",
+    "openai"
+  ]
+}

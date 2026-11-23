@@ -1,0 +1,17 @@
+{
+  "name": "agent-token-meter-marketplace",
+  "owner": {
+    "name": "KennyMcSimpson",
+    "url": "https://github.com/KennyMcSimpson"
+  },
+  "metadata": {
+    "description": "AgentTokenMeter — multi-agent local token usage and official API cost tracker for Antigravity, Claude Code, and Codex."
+  },
+  "plugins": [
+    {
+      "name": "agent-token-meter",
+      "source": "./",
+      "description": "Track daily token usage, prompt cache hit/write rates, and multi-provider equivalent API costs across Antigravity, Claude Code, and Codex."
+    }
+  ]
+}

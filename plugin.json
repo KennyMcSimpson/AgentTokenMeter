@@ -1,0 +1,21 @@
+{
+  "name": "agent-token-meter",
+  "displayName": "AgentTokenMeter",
+  "version": "2.0.0",
+  "description": "Zero-dependency local token usage, cache hit rate, and multi-provider official API cost tracker across Antigravity, Claude Code, and Codex with automatic lifecycle logging and a live dashboard.",
+  "logo": "assets/logo.svg",
+  "author": {
+    "name": "KennyMcSimpson",
+    "url": "https://github.com/KennyMcSimpson"
+  },
+  "homepage": "https://github.com/KennyMcSimpson/AgentTokenMeter",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/KennyMcSimpson/AgentTokenMeter"
+  },
+  "suggestedPrompts": [
+    "Show my token usage and equivalent API cost for the past 7 days",
+    "Which models and sessions used the most tokens this week?",
+    "Export my last 30 days of daily token usage and cost to CSV"
+  ]
+}

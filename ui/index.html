@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentTokenMeter</title>
+  <!-- HOST_CONFIG -->
+  <!-- HOST_PRELOAD -->
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="loading" class="loading" aria-live="polite" aria-busy="true">
+    <div class="skel-bar" style="width: 45%; height: 16px;"></div>
+    <div class="skel-grid">
+      <div class="skel-card"></div>
+      <div class="skel-card"></div>
+      <div class="skel-card"></div>
+      <div class="skel-card"></div>
+    </div>
+    <div class="skel-chart"></div>
+    <p class="loading-caption">Syncing local agent token logs...</p>
+  </div>
+
+  <div id="app" class="app hidden">
+    <header class="header">
+      <div class="header-top">
+        <div class="title-wrap">
+          <h1 class="app-title">AgentTokenMeter</h1>
+          <span id="scope-badge" class="badge hidden"></span>
+          <span id="live-pill" class="live-pill" title="Auto-syncs every 5 seconds">
+            <span class="live-dot" aria-hidden="true"></span>
+            <span id="live-text">Live</span>
+          </span>
+        </div>
+        <div class="header-actions">
+          <button id="btn-theme" type="button" class="icon-btn hidden" title="Toggle light/dark theme" aria-label="Toggle theme">◐</button>
+          <button id="btn-currency" type="button" class="pill-btn" title="Switch currency (USD / CNY)">USD $</button>
+          <button id="btn-sync" type="button" class="icon-btn" title="Sync latest logs now" aria-label="Sync now">
+            <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M13.5 8a5.5 5.5 0 1 1-1.35-3.6M13.5 2.5v2.75h-2.75"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="range-row">
+        <div id="agent-group" class="segmented hidden" role="group" aria-label="Agent filter">
+          <button type="button" class="seg-btn active" data-agent="all">All</button>
+          <button type="button" class="seg-btn" data-agent="antigravity">Antigravity</button>
+          <button type="button" class="seg-btn" data-agent="claude-code">Claude Code</button>
+          <button type="button" class="seg-btn" data-agent="codex">Codex</button>
+        </div>
+        <div id="range-group" class="segmented" role="group" aria-label="Date range">
+          <button type="button" class="seg-btn" data-days="1">Today</button>
+          <button type="button" class="seg-btn active" data-days="7">7d</button>
+          <button type="button" class="seg-btn" data-days="14">14d</button>
+          <button type="button" class="seg-btn" data-days="30">30d</button>
+          <button type="button" class="seg-btn" data-days="0">All</button>
+        </div>
+        <span id="header-meta" class="header-meta"></span>
+      </div>
+
+      <nav class="tabs" role="tablist" aria-label="Dashboard views">
+        <button type="button" role="tab" class="tab active" data-tab="overview" aria-selected="true">Overview</button>
+        <button type="button" role="tab" class="tab" data-tab="models" aria-selected="false">
+          Models <span id="tab-count-models" class="tab-count"></span>
+        </button>
+        <button type="button" role="tab" class="tab" data-tab="sessions" aria-selected="false">
+          Sessions <span id="tab-count-sessions" class="tab-count"></span>
+        </button>
+      </nav>
+    </header>
+
+    <main class="main">
+      <!-- Tab 1: Overview -->
+      <section id="panel-overview" class="tab-panel active" role="tabpanel">
+        <div id="kpi-grid" class="kpi-grid"></div>
+
+        <section id="agent-breakdown-card" class="card hidden">
+          <div class="card-header">
+            <h2 class="card-title">By Agent</h2>
+            <span id="agent-breakdown-sub" class="card-sub"></span>
+          </div>
+          <div id="agent-breakdown-bar" class="agent-split-bar"></div>
+          <div id="agent-breakdown-list" class="agent-split-list"></div>
+        </section>
+
+        <section class="card">
+          <div class="card-header">
+            <h2 class="card-title">Daily Trend</h2>
+            <div class="segmented sm" role="group" aria-label="Chart metric">
+              <button type="button" class="seg-btn active" data-metric="cost">Eq. Cost</button>
+              <button type="button" class="seg-btn" data-metric="tokens">Token Breakdown</button>
+            </div>
+          </div>
+          <div id="chart-legend" class="chart-legend"></div>
+          <div id="chart-wrap" class="chart-wrap"></div>
+          <div id="chart-detail" class="chart-detail"></div>
+        </section>
+
+        <section class="card">
+          <div class="card-header">
+            <h2 class="card-title">Daily Breakdown</h2>
+            <button id="btn-export" type="button" class="ghost-btn sm">Export CSV</button>
+          </div>
+          <div class="table-scroll">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th class="num">Steps</th>
+                  <th class="num">Input</th>
+                  <th class="num">Cache Read</th>
+                  <th class="num" id="th-cw">Cache Write</th>
+                  <th class="num">Output</th>
+                  <th class="num">Hit Rate</th>
+                  <th class="num">Eq. Cost</th>
+                </tr>
+              </thead>
+              <tbody id="daily-tbody"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <!-- Tab 2: Models -->
+      <section id="panel-models" class="tab-panel" role="tabpanel">
+        <section class="card">
+          <div class="card-header">
+            <h2 class="card-title">Usage by Model (Official Multi-Provider API Pricing)</h2>
+            <span id="models-subtitle" class="card-sub"></span>
+          </div>
+          <div id="models-list" class="models-list"></div>
+        </section>
+      </section>
+
+      <!-- Tab 3: Sessions -->
+      <section id="panel-sessions" class="tab-panel" role="tabpanel">
+        <div class="toolbar">
+          <input id="session-search" type="search" class="text-input" placeholder="Search session title, model, or ID..." autocomplete="off">
+          <select id="session-sort" class="select-input" aria-label="Sort sessions">
+            <option value="cost">Sort by Cost</option>
+            <option value="tokens">Sort by Tokens</option>
+            <option value="recent">Sort by Recent</option>
+          </select>
+        </div>
+        <div id="sessions-list" class="sessions-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

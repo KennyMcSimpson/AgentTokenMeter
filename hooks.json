@@ -1,0 +1,11 @@
+{
+  "agent-token-meter-recorder": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node ./hooks/record.mjs",
+        "timeout": 10
+      }
+    ]
+  }
+}
