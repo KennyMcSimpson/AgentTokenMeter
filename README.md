@@ -148,6 +148,7 @@ node bin/token-meter.mjs uninstall codex
 | `TOKEN_METER_BRAIN_ROOTS` | Override Antigravity brain roots (`:` / `;` separated; empty string disables scan) |
 | `TOKEN_METER_CLAUDE_ROOTS` | Override Claude Code project roots (defaults to `$CLAUDE_CONFIG_DIR/projects` or `~/.claude/projects`) |
 | `TOKEN_METER_CODEX_ROOTS` | Override Codex session roots (defaults to `$CODEX_HOME/sessions` and `$CODEX_HOME/archived_sessions`) |
+| `TOKEN_METER_MAX_ZSTD_BYTES` | Override per-archive `.jsonl.zst` decompression safety limit in bytes (default: 2 GiB) |
 
 Create `<dataDir>/pricing.override.json` to add custom models or apply channel/proxy multipliers:
 

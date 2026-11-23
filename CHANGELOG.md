@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.2 — Large `.jsonl.zst` Streaming, Native Revert Filenames, Seamless Ledger Upgrades & Rate Accuracy
+
+### Fixed
+- **Large `.jsonl.zst` Archives (>256 MiB) & Skipped-File Visibility**: Replaced full-file record buffering with single-pass streaming line feeding and frame-by-frame zstd decompression (2 GiB default safety cap, overridable via `TOKEN_METER_MAX_ZSTD_BYTES`), and surfaced any unreadable/skipped source files in `sync` output and `summary` warnings instead of dropping silently.
+- **Native Codex 0.171 Revert Filenames (`<threadId>_<rolloutId>`)**: Parsed `<threadId>_<rolloutId>.jsonl[.zst]` so the first UUID locks the thread session ID and the second UUID namespaces event keys (`rev:<rolloutId>:tc:N`), matching Codex `rollout_file_name.rs`.
+- **Clean Legacy Ledger Upgrades (v2.0.0 / v2.0.1 → v2.0.2)**: Added `parserVersion` tracking to Codex cursors and session-scoped replacement (`replaceSessionKeys`) in `compactEventsPreservingArchived`, automatically rescanning upgraded sessions and purging stale misattributed keys while still preserving archived events from deleted transcripts.
+- **OpenAI Rate Card Accuracy**: Corrected `gpt-6-sol` cached input to `$0.20/M` (`$0.40/M` at `>272K`) and applied official OpenAI 30-minute prompt cache write pricing (`1.25x` input, doubled at `>272K`) to GPT-6.x / GPT-5.6 / GPT-5.5 models.
+- **Codex Metadata Edge Cases**: Extracted nested `payload.source.subagent.thread_spawn.parent_thread_id` for subagent lineage, and backfilled cross-batch pre-`turn_context` `unknown` Codex events in `buildReport()` as soon as the session's model arrives.
+- **Installer Comment Accuracy**: Corrected Unix hook execution comment in `bin/installer.mjs` to reflect login shell (`-lc`).
+
 ## 2.0.1 — Codex 0.171 Compatibility, Archive Coverage & Pricing Accuracy
 
 ### Fixed

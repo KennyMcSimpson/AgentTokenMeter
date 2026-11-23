@@ -42,16 +42,30 @@ function flatRates(input, cacheRead, output, tierNote = 'Official standard tier'
   };
 }
 
-function openaiTiered272k(input, cacheRead, output, cacheLabel = '90% cache discount') {
-  return ({ promptTotal }) =>
-    promptTotal > LONG_CTX_272K
-      ? flatRates(
-          roundRate(input * 2),
-          roundRate(cacheRead * 2),
-          roundRate(output * 1.5),
-          'OpenAI official long-context (>272K)',
-        )
-      : flatRates(input, cacheRead, output, `OpenAI official (${cacheLabel}; <=272K / >272K tiered)`);
+function openaiTiered272k(
+  input,
+  cacheRead,
+  output,
+  cacheLabel = '90% cache discount',
+  { cacheWrite30mMult = 1.25, cacheWrite12hMult = 2.5 } = {},
+) {
+  return ({ promptTotal }) => {
+    const isLong = promptTotal > LONG_CTX_272K;
+    const effIn = isLong ? roundRate(input * 2) : input;
+    const effCr = isLong ? roundRate(cacheRead * 2) : cacheRead;
+    const effOut = isLong ? roundRate(output * 1.5) : output;
+    const cwNote = cacheWrite30mMult > 1 ? `; ${cacheWrite30mMult}x cache write` : '';
+    return {
+      input: effIn,
+      cacheRead: effCr,
+      cacheWrite5m: roundRate(effIn * cacheWrite30mMult),
+      cacheWrite1h: roundRate(effIn * cacheWrite12hMult),
+      output: effOut,
+      tierNote: isLong
+        ? `OpenAI official long-context (>272K${cwNote})`
+        : `OpenAI official (${cacheLabel}${cwNote}; <=272K / >272K tiered)`,
+    };
+  };
 }
 
 export const OFFICIAL_PRICING_RULES = [
@@ -298,7 +312,7 @@ export const OFFICIAL_PRICING_RULES = [
     provider: 'openai',
     prefix: 'gpt-6-sol',
     family: 'GPT-6 Sol',
-    resolve: openaiTiered272k(2.0, 0.1, 10.0, '95% cache discount'),
+    resolve: openaiTiered272k(2.0, 0.2, 10.0, '90% cache discount'),
   },
   {
     provider: 'openai',
@@ -340,7 +354,10 @@ export const OFFICIAL_PRICING_RULES = [
     provider: 'openai',
     prefix: 'gpt-5.4',
     family: 'GPT-5.4',
-    resolve: openaiTiered272k(2.5, 0.25, 15.0, '90% cache discount'),
+    resolve: openaiTiered272k(2.5, 0.25, 15.0, '90% cache discount', {
+      cacheWrite30mMult: 1.0,
+      cacheWrite12hMult: 1.0,
+    }),
   },
   {
     provider: 'openai',

@@ -207,37 +207,39 @@ test('pricing.override.json malformed non-numeric values never poison costs with
   }
 });
 
-test('OpenAI GPT-6 / GPT-5.6 / GPT-5.5 official rates and >272K long-context tiering', () => {
+test('OpenAI GPT-6 / GPT-5.6 / GPT-5.5 official rates, 1.25x cache write, and >272K long-context tiering', () => {
   const cases = [
-    ['gpt-6.2-astra', 8.0, 0.4, 40.0],
-    ['gpt-6-astra', 10.0, 1.0, 50.0],
-    ['gpt-6.2-sol', 2.0, 0.1, 10.0],
-    ['gpt-6.1-sol', 2.0, 0.1, 10.0],
-    ['gpt-6-sol', 2.0, 0.1, 10.0],
-    ['gpt-6.1-terra', 1.0, 0.05, 5.0],
-    ['gpt-6-luna', 0.1, 0.01, 0.5],
-    ['gpt-5.6-sol', 4.0, 0.4, 20.0],
-    ['gpt-5.6-terra', 2.0, 0.2, 12.0],
-    ['gpt-5.6-luna', 0.2, 0.02, 1.2],
-    ['gpt-5.5', 5.0, 0.5, 30.0],
-    ['gpt-5.4', 2.5, 0.25, 15.0],
+    ['gpt-6.2-astra', 8.0, 0.4, 10.0, 40.0],
+    ['gpt-6-astra', 10.0, 1.0, 12.5, 50.0],
+    ['gpt-6.2-sol', 2.0, 0.1, 2.5, 10.0],
+    ['gpt-6.1-sol', 2.0, 0.1, 2.5, 10.0],
+    ['gpt-6-sol', 2.0, 0.2, 2.5, 10.0],
+    ['gpt-6.1-terra', 1.0, 0.05, 1.25, 5.0],
+    ['gpt-6-luna', 0.1, 0.01, 0.125, 0.5],
+    ['gpt-5.6-sol', 4.0, 0.4, 5.0, 20.0],
+    ['gpt-5.6-terra', 2.0, 0.2, 2.5, 12.0],
+    ['gpt-5.6-luna', 0.2, 0.02, 0.25, 1.2],
+    ['gpt-5.5', 5.0, 0.5, 6.25, 30.0],
+    ['gpt-5.4', 2.5, 0.25, 2.5, 15.0],
   ];
 
-  for (const [model, inp, cr, out] of cases) {
+  for (const [model, inp, cr, cw5, out] of cases) {
     const std = resolveModelRate(model, { promptTotal: 272_000 });
     assert.equal(std.matchType, 'official', `${model} should match official`);
     assert.equal(std.provider, 'openai');
     assert.equal(std.input, inp, `${model} standard input`);
     assert.equal(std.cacheRead, cr, `${model} standard cacheRead`);
+    assert.equal(std.cacheWrite5m, cw5, `${model} standard cacheWrite5m`);
     assert.equal(std.output, out, `${model} standard output`);
 
     const longCtx = resolveModelRate(model, { promptTotal: 272_001 });
     assert.equal(longCtx.input, Math.round(inp * 2 * 10_000) / 10_000, `${model} >272K input`);
     assert.equal(longCtx.cacheRead, Math.round(cr * 2 * 10_000) / 10_000, `${model} >272K cacheRead`);
+    assert.equal(longCtx.cacheWrite5m, Math.round(cw5 * 2 * 10_000) / 10_000, `${model} >272K cacheWrite5m`);
     assert.equal(longCtx.output, Math.round(out * 1.5 * 10_000) / 10_000, `${model} >272K output`);
   }
 
-  // Verify end-to-end report pricing uses inclusive promptTotal (in + cr + cw5) for >272K check
+  // Verify end-to-end report pricing uses inclusive promptTotal (in + cr + cw5) for >272K check & 1.25x cw5 rate
   const h = createTestEnv('atm-272k-');
   try {
     const rollout = h.mkCodexRollout(
@@ -255,7 +257,7 @@ test('OpenAI GPT-6 / GPT-5.6 / GPT-5.5 official rates and >272K long-context tie
         JSON.stringify({
           timestamp: '2026-11-23T09:00:01Z',
           type: 'turn_context',
-          payload: { model: 'gpt-6.1-sol' },
+          payload: { model: 'gpt-6.2-sol' },
         }),
         JSON.stringify({
           timestamp: '2026-11-23T09:00:05Z',
@@ -263,8 +265,13 @@ test('OpenAI GPT-6 / GPT-5.6 / GPT-5.5 official rates and >272K long-context tie
           payload: {
             type: 'token_count',
             info: {
-              // Inclusive input = 280,000 (>272K) -> uncached 30k @ $4/M + cached 250k @ $0.20/M + output 10k @ $15/M
-              total_token_usage: { input_tokens: 280_000, cached_input_tokens: 250_000, output_tokens: 10_000 },
+              // Inclusive input = 280,000 (>272K) -> uncached 20k @ $4/M + cached 250k @ $0.20/M + cw5 10k @ $5/M + output 10k @ $15/M
+              total_token_usage: {
+                input_tokens: 280_000,
+                cached_input_tokens: 250_000,
+                cache_write_input_tokens: 10_000,
+                output_tokens: 10_000,
+              },
             },
           },
         }),
@@ -273,8 +280,8 @@ test('OpenAI GPT-6 / GPT-5.6 / GPT-5.5 official rates and >272K long-context tie
     );
     syncAllSources({ dataDir: h.dataDir });
     const rep = buildReport({ dataDir: h.dataDir, rangeDays: 0, timeZone: 'UTC' });
-    // Expected: 0.03 * 4 + 0.25 * 0.2 + 0.01 * 15 = 0.12 + 0.05 + 0.15 = $0.32
-    assert.equal(Number(rep.period.costUsd.toFixed(6)), 0.32);
+    // Expected: 0.02 * 4 + 0.25 * 0.2 + 0.01 * 5 + 0.01 * 15 = 0.08 + 0.05 + 0.05 + 0.15 = $0.33
+    assert.equal(Number(rep.period.costUsd.toFixed(6)), 0.33);
   } finally {
     h.cleanup();
   }

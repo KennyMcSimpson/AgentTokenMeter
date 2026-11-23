@@ -180,20 +180,34 @@ export function appendEventsByMonth(dataDir, events) {
 }
 
 /**
- * Full-rescan compaction that preserves archived events from deleted transcripts,
+ * Full-rescan / upgrade compaction that preserves archived events from deleted transcripts,
+ * replaces events for explicitly refreshed live sessions (`replaceSessionKeys`),
  * overwrites matching keys with rebuilt events, and removes orphaned empty month files
  * left behind when an event moves across a month boundary.
  */
-export function compactEventsPreservingArchived(dataDir, rebuiltEvents) {
+export function compactEventsPreservingArchived(
+  dataDir,
+  rebuiltEvents,
+  { replaceSessionKeys = null } = {},
+) {
   const dir = eventsDir(dataDir);
   mkdirSync(dir, { recursive: true });
   const existingFiles = safeReaddir(dir)
     .filter((f) => f.endsWith('.jsonl'))
     .sort();
+  const replaceSet =
+    replaceSessionKeys instanceof Set
+      ? replaceSessionKeys
+      : Array.isArray(replaceSessionKeys)
+        ? new Set(replaceSessionKeys)
+        : null;
   const merged = new Map();
 
   for (const file of existingFiles) {
     for (const e of parseMonthFile(join(dir, file))) {
+      if (replaceSet && replaceSet.has(sessionKey(e.a, e.c))) {
+        continue;
+      }
       merged.set(eventKey(e), e);
     }
   }

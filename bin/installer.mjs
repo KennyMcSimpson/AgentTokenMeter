@@ -152,7 +152,7 @@ export function installTarget(target, { dryRun = false, force = false, allAgents
     const cfg = readStrictJsonObject(path);
     const existingHooks =
       cfg.hooks && typeof cfg.hooks === 'object' && !Array.isArray(cfg.hooks) ? structuredClone(cfg.hooks) : {};
-    // Codex executes `command` via `%COMSPEC% /C` on Windows and `sh -c` on Unix,
+    // Codex executes `command` via `%COMSPEC% /C` on Windows and a login shell (`-lc`) on Unix,
     // so a plain quoted `command` works cross-platform without `commandWindows`.
     upsertHookEvent(
       existingHooks,

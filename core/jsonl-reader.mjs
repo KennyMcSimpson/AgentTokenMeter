@@ -1,12 +1,27 @@
+import { Buffer, constants as bufferConstants } from 'node:buffer';
 import { closeSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
 import * as zlib from 'node:zlib';
 
 const HAS_ZSTD = typeof zlib.zstdDecompressSync === 'function';
-const MAX_ZSTD_UNCOMPRESSED_BYTES = 256 * 1024 * 1024; // 256 MB safety cap per archive
+// Default 2 GiB safety cap per `.zst` archive (real multi-day rollouts can exceed 450 MiB).
+// Overridable via `TOKEN_METER_MAX_ZSTD_BYTES` or per-call options.
+const MAX_BUFFER_BYTES = bufferConstants.MAX_LENGTH;
+const DEFAULT_MAX_ZSTD_BYTES = Math.min(2 * 1024 * 1024 * 1024, MAX_BUFFER_BYTES);
+const PLAIN_CHUNK_BYTES = 16 * 1024 * 1024; // 16 MiB chunked read for large plain `.jsonl` files
 const ZSTD_MAGIC = 0xfd2fb528;
 
 export function supportsZstd() {
   return HAS_ZSTD;
+}
+
+function resolveMaxZstdBytes(override) {
+  if (Number.isFinite(override) && override > 0) return Math.min(override, MAX_BUFFER_BYTES);
+  const envRaw = process.env.TOKEN_METER_MAX_ZSTD_BYTES;
+  if (envRaw !== undefined && envRaw.trim()) {
+    const parsed = Number(envRaw);
+    if (Number.isFinite(parsed) && parsed > 0) return Math.min(parsed, MAX_BUFFER_BYTES);
+  }
+  return DEFAULT_MAX_ZSTD_BYTES;
 }
 
 /**
@@ -62,20 +77,18 @@ function inspectZstdFrame(buf) {
 }
 
 /**
- * Decompress single-frame or concatenated multi-frame `.zst` buffers safely with a hard output cap.
- * Returns null if truncated/corrupt or if total decompressed size exceeds MAX_ZSTD_UNCOMPRESSED_BYTES.
+ * Pre-validate all zstd and skippable frames in `compressed` before emitting any records.
+ * Returns an array of data frame descriptors `{ offset, frameLen, expectedFcs }` or `null` if invalid/over-cap.
  */
-function decompressZstdAllFrames(compressed) {
+function inspectAllZstdFrames(compressed, maxZstdBytes) {
   if (!HAS_ZSTD || !Buffer.isBuffer(compressed)) return null;
-  if (compressed.length === 0) return Buffer.alloc(0);
+  if (compressed.length === 0) return [];
 
-  const chunks = [];
+  const frames = [];
   let offset = 0;
-  let totalOut = 0;
+  let knownOutTotal = 0;
 
   while (offset < compressed.length) {
-    const remainingCap = MAX_ZSTD_UNCOMPRESSED_BYTES - totalOut;
-    if (remainingCap <= 0) return null;
     const frameSlice = compressed.subarray(offset);
     if (frameSlice.length >= 8) {
       const magic = frameSlice.readUInt32LE(0);
@@ -88,100 +101,123 @@ function decompressZstdAllFrames(compressed) {
     }
     const info = inspectZstdFrame(frameSlice);
     if (!info) return null;
-    if (info.expectedFcs !== null && info.expectedFcs > remainingCap) return null;
-
-    const exactFrame = frameSlice.subarray(0, info.frameLen);
-    const outBuf = zlib.zstdDecompressSync(exactFrame, {
-      maxOutputLength: remainingCap,
-    });
-    if (!Buffer.isBuffer(outBuf)) return null;
-    if (info.expectedFcs !== null && outBuf.length !== info.expectedFcs) return null;
-
-    totalOut += outBuf.length;
-    if (totalOut > MAX_ZSTD_UNCOMPRESSED_BYTES) return null;
-    if (outBuf.length > 0) chunks.push(outBuf);
+    if (info.expectedFcs !== null) {
+      knownOutTotal += info.expectedFcs;
+      if (knownOutTotal > maxZstdBytes) return null;
+    }
+    frames.push({ offset, frameLen: info.frameLen, expectedFcs: info.expectedFcs });
     offset += info.frameLen;
   }
 
-  return chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, totalOut);
+  return frames;
 }
 
-function parseJsonlBuffer(slice, startOffset, allowIncompleteTail) {
-  const records = [];
-  let newOffset = startOffset;
-  const lastNl = slice.lastIndexOf(0x0a);
-
-  if (lastNl >= 0) {
-    let lineStart = 0;
-    for (let i = 0; i <= lastNl; i++) {
-      if (slice[i] === 0x0a) {
-        const lineBuf = slice.subarray(lineStart, i);
-        const rawLine = lineBuf.toString('utf-8').replace(/^\uFEFF/, '').trim();
-        if (rawLine) {
-          try {
-            const obj = JSON.parse(rawLine);
-            if (obj && typeof obj === 'object') {
-              records.push({ obj, byteOffset: startOffset + lineStart });
-            }
-          } catch {
-            // Ignore malformed newline-terminated line
-          }
-        }
-        lineStart = i + 1;
-      }
-    }
-    newOffset = startOffset + lastNl + 1;
-
-    if (lastNl + 1 < slice.length) {
-      const trailing = slice.subarray(lastNl + 1).toString('utf-8').replace(/^\uFEFF/, '').trim();
-      if (trailing) {
-        try {
-          const obj = JSON.parse(trailing);
-          if (obj && typeof obj === 'object') {
-            records.push({ obj, byteOffset: startOffset + lastNl + 1 });
-            newOffset = startOffset + slice.length;
-          }
-        } catch {
-          if (!allowIncompleteTail) {
-            newOffset = startOffset + slice.length;
-          }
-        }
-      } else {
-        newOffset = startOffset + slice.length;
-      }
-    }
-  } else {
-    const trailing = slice.toString('utf-8').replace(/^\uFEFF/, '').trim();
-    if (trailing) {
-      try {
-        const obj = JSON.parse(trailing);
-        if (obj && typeof obj === 'object') {
-          records.push({ obj, byteOffset: startOffset });
-          newOffset = startOffset + slice.length;
-        }
-      } catch {
-        if (!allowIncompleteTail) {
-          newOffset = startOffset + slice.length;
-        }
-      }
-    } else {
-      newOffset = startOffset + slice.length;
-    }
+function isBlankAsciiBuffer(buf) {
+  let i = 0;
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
+    i = 3;
   }
+  for (; i < buf.length; i++) {
+    const c = buf[i];
+    if (c !== 0x20 && c !== 0x09 && c !== 0x0d && c !== 0x0a) return false;
+  }
+  return true;
+}
 
-  return { records, newOffset };
+function parseLineBuffer(lineBuf, byteOffset, emit, shouldParseLine) {
+  if (lineBuf.length === 0 || isBlankAsciiBuffer(lineBuf)) return true;
+  if (shouldParseLine && !shouldParseLine(lineBuf)) return true;
+  const rawLine = lineBuf.toString('utf-8').replace(/^\uFEFF/, '').trim();
+  if (!rawLine) return true;
+  try {
+    const obj = JSON.parse(rawLine);
+    if (obj && typeof obj === 'object') {
+      emit(obj, byteOffset);
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  return true;
 }
 
 /**
- * Shared incremental JSONL (and whole-file `.jsonl.zst`) reader with
+ * Stateful streaming JSONL line feeder supporting chunked buffers (plain or multi-frame `.zst`)
+ * without holding the entire file's parsed objects in memory.
+ */
+function createLineFeeder({ startOffset = 0, allowIncompleteTail = true, onRecord = null, shouldParseLine = null }) {
+  const records = onRecord ? null : [];
+  const emit = onRecord || ((obj, byteOffset) => records.push({ obj, byteOffset }));
+  let carry = Buffer.alloc(0);
+  let carryOffset = startOffset;
+  let newOffset = startOffset;
+
+  function push(chunk) {
+    if (!chunk || chunk.length === 0) return;
+    const buf = carry.length > 0 ? Buffer.concat([carry, chunk]) : chunk;
+    const baseOffset = carryOffset;
+    let lineStart = 0;
+    let lastNl = -1;
+
+    for (let i = 0; i < buf.length; i++) {
+      if (buf[i] === 0x0a) {
+        const lineBuf = buf.subarray(lineStart, i);
+        parseLineBuffer(lineBuf, baseOffset + lineStart, emit, shouldParseLine);
+        lineStart = i + 1;
+        lastNl = i;
+      }
+    }
+
+    if (lastNl >= 0) {
+      newOffset = baseOffset + lastNl + 1;
+    }
+
+    if (lineStart < buf.length) {
+      // Copy remaining tail so the large chunk buffer can be GC'd immediately
+      carry = Buffer.from(buf.subarray(lineStart));
+      carryOffset = baseOffset + lineStart;
+    } else {
+      carry = Buffer.alloc(0);
+      carryOffset = baseOffset + buf.length;
+    }
+  }
+
+  function finish() {
+    if (carry.length > 0) {
+      if (isBlankAsciiBuffer(carry)) {
+        newOffset = carryOffset + carry.length;
+      } else {
+        // Always attempt JSON.parse on trailing non-newline tail when allowIncompleteTail=true
+        // so torn lines are never skipped past; honor shouldParseLine only when !allowIncompleteTail
+        const filter = allowIncompleteTail ? null : shouldParseLine;
+        const ok = parseLineBuffer(carry, carryOffset, emit, filter);
+        if (ok || !allowIncompleteTail) {
+          newOffset = carryOffset + carry.length;
+        }
+      }
+      carry = Buffer.alloc(0);
+    }
+    return { records: records || [], newOffset };
+  }
+
+  return { push, finish };
+}
+
+/**
+ * Shared incremental JSONL (and streaming frame-by-frame `.jsonl.zst`) reader with
  * inode/truncation/shrink detection and torn-line safety.
  *
+ * Options (optional 4th arg):
+ * - `onRecord(obj, byteOffset)`: streaming callback (avoids allocating `records[]` for huge files)
+ * - `shouldParseLine(lineBuf)`: optional fast Buffer pre-filter before `JSON.parse`
+ * - `maxZstdBytes`: override default 2 GiB zstd decompression safety cap
+ *
  * Returns:
- * - null if the file cannot be statted or zstd decompression is unsupported/corrupt
+ * - null if the file cannot be statted or zstd decompression is unsupported/corrupt/over-cap
  * - { unchanged: true } if size, mtimeMs, and ino match the previous cursor
  * - { unchanged: false, reset: boolean, stat, newOffset, records: Array<{ obj, byteOffset }> }
  */
-export function readJsonlDelta(filePath, prevCursor, forceFull = false) {
+export function readJsonlDelta(filePath, prevCursor, forceFull = false, options = null) {
   let st;
   try {
     st = statSync(filePath);
@@ -201,14 +237,41 @@ export function readJsonlDelta(filePath, prevCursor, forceFull = false) {
     return { unchanged: true };
   }
 
-  // Compressed `.zst` archives are immutable snapshots: decompress all frames once when changed
+  const onStart = typeof options?.onStart === 'function' ? options.onStart : null;
+  const onRecord = typeof options?.onRecord === 'function' ? options.onRecord : null;
+  const shouldParseLine = typeof options?.shouldParseLine === 'function' ? options.shouldParseLine : null;
+
+  // Compressed `.zst` archives are immutable snapshots: validate all frames, then stream-decompress frame by frame
   if (String(filePath).toLowerCase().endsWith('.zst')) {
     if (!HAS_ZSTD) return null;
     try {
+      const maxZstdBytes = resolveMaxZstdBytes(options?.maxZstdBytes);
       const compressed = readFileSync(filePath);
-      const plain = decompressZstdAllFrames(compressed);
-      if (!plain) return null;
-      const { records } = parseJsonlBuffer(plain, 0, false);
+      const frames = inspectAllZstdFrames(compressed, maxZstdBytes);
+      if (!frames) return null;
+
+      if (onStart) onStart({ reset: true, stat: st });
+      const feeder = createLineFeeder({
+        startOffset: 0,
+        allowIncompleteTail: false,
+        onRecord,
+        shouldParseLine,
+      });
+
+      let totalOut = 0;
+      for (const frame of frames) {
+        const remainingCap = maxZstdBytes - totalOut;
+        if (remainingCap <= 0) return null;
+        const exactFrame = compressed.subarray(frame.offset, frame.offset + frame.frameLen);
+        const outBuf = zlib.zstdDecompressSync(exactFrame, { maxOutputLength: remainingCap });
+        if (!Buffer.isBuffer(outBuf)) return null;
+        if (frame.expectedFcs !== null && outBuf.length !== frame.expectedFcs) return null;
+        totalOut += outBuf.length;
+        if (totalOut > maxZstdBytes) return null;
+        feeder.push(outBuf);
+      }
+
+      const { records } = feeder.finish();
       return {
         unchanged: false,
         reset: true,
@@ -231,6 +294,8 @@ export function readJsonlDelta(filePath, prevCursor, forceFull = false) {
   const startOffset = reset ? 0 : prev.offset;
   const bytesToRead = st.size - startOffset;
 
+  if (onStart) onStart({ reset, stat: st });
+
   if (bytesToRead <= 0) {
     return {
       unchanged: false,
@@ -241,22 +306,32 @@ export function readJsonlDelta(filePath, prevCursor, forceFull = false) {
     };
   }
 
-  const buf = Buffer.allocUnsafe(bytesToRead);
+  const feeder = createLineFeeder({
+    startOffset,
+    allowIncompleteTail: true,
+    onRecord,
+    shouldParseLine,
+  });
+
+  const chunkSize = Math.min(bytesToRead, PLAIN_CHUNK_BYTES);
+  const buf = Buffer.allocUnsafe(chunkSize);
   const fd = openSync(filePath, 'r');
-  let totalRead = 0;
+  let remaining = bytesToRead;
+  let filePos = startOffset;
   try {
-    while (totalRead < bytesToRead) {
-      const n = readSync(fd, buf, totalRead, bytesToRead - totalRead, startOffset + totalRead);
+    while (remaining > 0) {
+      const toRead = Math.min(remaining, chunkSize);
+      const n = readSync(fd, buf, 0, toRead, filePos);
       if (n <= 0) break;
-      totalRead += n;
+      feeder.push(n === buf.length ? buf : buf.subarray(0, n));
+      filePos += n;
+      remaining -= n;
     }
   } finally {
     closeSync(fd);
   }
 
-  const slice = totalRead === bytesToRead ? buf : buf.subarray(0, totalRead);
-  const { records, newOffset } = parseJsonlBuffer(slice, startOffset, true);
-
+  const { records, newOffset } = feeder.finish();
   return {
     unchanged: false,
     reset,

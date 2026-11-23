@@ -89,8 +89,9 @@ function recentUtcMonths(nowMs = Date.now()) {
 function cmdSummary(flags) {
   const dataDir = getDataDir();
   const agent = normalizeAgentFilter(flags.agent);
+  let syncRes = null;
   if (!flags['no-sync']) {
-    syncAllSources({ dataDir, agents: agent === 'all' ? null : [agent] });
+    syncRes = syncAllSources({ dataDir, agents: agent === 'all' ? null : [agent] });
   }
   const days = flags.days !== undefined ? Number(flags.days) : 7;
   const prefs = loadPrefs(dataDir);
@@ -136,6 +137,11 @@ function cmdSummary(flags) {
   if (!supportsZstd() && (report.agentFilter === 'all' || report.agentFilter === 'codex')) {
     console.log(
       `Note: Node.js ${process.version} lacks built-in zstd decompression; compressed Codex .jsonl.zst archives were skipped (requires Node.js >=22.15.0).`,
+    );
+  }
+  if (syncRes && syncRes.skipped > 0) {
+    console.log(
+      `Warning: ${syncRes.skipped} source file(s) could not be read and were skipped (run 'sync' to inspect skippedFiles).`,
     );
   }
 

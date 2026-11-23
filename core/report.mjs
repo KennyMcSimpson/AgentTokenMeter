@@ -173,11 +173,18 @@ export function buildReport({
     });
   }
 
-  // Inherit parent model for legacy pre-Nov-19 Antigravity subagents via parentSessionId chain
+  // Inherit session/parent model for unknown events:
+  // - Codex: backfill pre-`turn_context` unknown events once the session's `lastModel` arrives in a later scan
+  // - Antigravity: inherit parent model for legacy pre-Nov-19 subagents via `parentSessionId` chain
   const inheritedModelCache = new Map();
   const resolveEventModel = (evAgent, sid, rawModel) => {
     const norm = normalizeModel(rawModel);
-    if (norm !== 'unknown' || evAgent !== 'antigravity') return norm;
+    if (norm !== 'unknown') return norm;
+    if (evAgent === 'codex') {
+      const sm = normalizeModel(sessions[sessionKey(evAgent, sid)]?.lastModel);
+      return sm !== 'unknown' ? sm : 'unknown';
+    }
+    if (evAgent !== 'antigravity') return norm;
     const cacheKey = sessionKey(evAgent, sid);
     if (inheritedModelCache.has(cacheKey)) return inheritedModelCache.get(cacheKey);
     let cur = sid;

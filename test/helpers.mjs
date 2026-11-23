@@ -43,6 +43,7 @@ export function createTestEnv(prefix = 'atm-test-') {
     'TOKEN_METER_BRAIN_ROOTS',
     'TOKEN_METER_CLAUDE_ROOTS',
     'TOKEN_METER_CODEX_ROOTS',
+    'TOKEN_METER_MAX_ZSTD_BYTES',
     'CLAUDE_CONFIG_DIR',
     'CODEX_HOME',
   ];

@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 import * as zlib from 'node:zlib';
+import { canonicalFileKey } from '../core/fs-utils.mjs';
 import { buildReport } from '../core/report.mjs';
 import { syncAllSources, syncSingleSource } from '../core/sync.mjs';
 import { createTestEnv } from './helpers.mjs';
@@ -958,6 +959,437 @@ test('Codex red-team regressions: multi-frame & truncated .zst, sparse replay, v
 
     assert.equal(handoffSess.steps, 2);
     assert.equal(handoffSess.total, 2_200);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Codex v2.0.2 regressions: >256MiB .jsonl.zst streaming, skippedFiles reporting, native <threadId>_<rolloutId> revert, nested parent_thread_id, cross-batch model backfill, and v2.0.0 ledger upgrade', () => {
+  const h = createTestEnv('atm-codex-v202-');
+  try {
+    // 1. Large (>256 MiB uncompressed) .jsonl.zst must decompress cleanly without silent drops
+    const hugeId = '61616161-6161-6161-6161-616161616161';
+    const padLine = JSON.stringify({ type: 'response_item', payload: { type: 'function_call_output', output: 'z'.repeat(100_000) } }) + '\n';
+    const head =
+      JSON.stringify({ timestamp: '2026-11-12T08:00:00Z', type: 'session_meta', payload: { id: hugeId } }) +
+      '\n' +
+      JSON.stringify({ timestamp: '2026-11-12T08:00:01Z', type: 'turn_context', payload: { model: 'gpt-6.2-sol' } }) +
+      '\n' +
+      JSON.stringify({
+        timestamp: '2026-11-12T08:00:02Z',
+        type: 'event_msg',
+        payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 1_000, output_tokens: 100 } } },
+      }) +
+      '\n';
+    const tail =
+      JSON.stringify({
+        timestamp: '2026-11-12T08:00:05Z',
+        type: 'event_msg',
+        payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 3_000, output_tokens: 300 } } },
+      }) + '\n';
+    // 270 MiB of uncompressed JSONL (>256 MiB old cap)
+    const hugeBuf = Buffer.concat([
+      Buffer.from(head, 'utf-8'),
+      Buffer.from(padLine.repeat(2750), 'utf-8'),
+      Buffer.from(tail, 'utf-8'),
+    ]);
+    assert.ok(hugeBuf.length > 260 * 1024 * 1024);
+    const hugeFile = h.mkCodexRollout('2026/11/12', `rollout-2026-11-12T08-00-00-${hugeId}.jsonl.zst`);
+    writeFileSync(hugeFile, zlib.zstdCompressSync(hugeBuf));
+
+    // 2. Native Codex 0.171 `<threadId>_<rolloutId>.jsonl` revert filename
+    const natThreadId = '62626262-6262-6262-6262-626262626262';
+    const natRolloutId = '63636363-6363-6363-6363-636363636363';
+    const natMain = h.mkCodexRollout('2026/11/22', `rollout-2026-11-22T09-00-00-${natThreadId}.jsonl`);
+    writeFileSync(
+      natMain,
+      [
+        JSON.stringify({ timestamp: '2026-11-22T09:00:00Z', type: 'session_meta', payload: { id: natThreadId } }),
+        JSON.stringify({ timestamp: '2026-11-22T09:00:01Z', type: 'turn_context', payload: { model: 'gpt-6.1-sol' } }),
+        JSON.stringify({
+          timestamp: '2026-11-22T09:00:02Z',
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 5_000, output_tokens: 500 } } },
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+    const natRevertContent =
+      [
+        JSON.stringify({ timestamp: '2026-11-22T09:05:00Z', type: 'session_meta', payload: { id: natThreadId } }),
+        JSON.stringify({ timestamp: '2026-11-22T09:05:01Z', type: 'turn_context', payload: { model: 'gpt-6.1-sol' } }),
+        JSON.stringify({
+          timestamp: '2026-11-22T09:05:02Z',
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 2_000, output_tokens: 200 } } },
+        }),
+      ].join('\n') + '\n';
+    const natRevert = h.mkCodexRollout(
+      '2026/11/22',
+      `rollout-2026-11-22T09-05-00-${natThreadId}_${natRolloutId}.jsonl`,
+    );
+    writeFileSync(natRevert, natRevertContent, 'utf-8');
+
+    // 3. Nested `source.subagent.thread_spawn.parent_thread_id`
+    const nestedChildId = '64646464-6464-6464-6464-646464646464';
+    const nestedChild = h.mkCodexRollout('2026/11/22', `rollout-2026-11-22T09-10-00-${nestedChildId}.jsonl`);
+    writeFileSync(
+      nestedChild,
+      [
+        JSON.stringify({
+          timestamp: '2026-11-22T09:10:00Z',
+          type: 'session_meta',
+          payload: {
+            id: nestedChildId,
+            source: { subagent: { thread_spawn: { parent_thread_id: natThreadId } } },
+          },
+        }),
+        JSON.stringify({ timestamp: '2026-11-22T09:10:01Z', type: 'turn_context', payload: { model: 'gpt-6-luna' } }),
+        JSON.stringify({
+          timestamp: '2026-11-22T09:10:02Z',
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 1_000, output_tokens: 100 } } },
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+
+    // 4. Cross-batch pre-turn_context model backfill (Batch 1 has token_count only, Batch 2 adds turn_context)
+    const lateModelId = '65656565-6565-6565-6565-656565656565';
+    const lateModelFile = h.mkCodexRollout('2026/11/22', `rollout-2026-11-22T09-20-00-${lateModelId}.jsonl`);
+    writeFileSync(
+      lateModelFile,
+      [
+        JSON.stringify({ timestamp: '2026-11-22T09:20:00Z', type: 'session_meta', payload: { id: lateModelId } }),
+        JSON.stringify({
+          timestamp: '2026-11-22T09:20:02Z',
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 4_000, output_tokens: 400 } } },
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+
+    const sync1 = syncAllSources({ dataDir: h.dataDir });
+    assert.equal(sync1.skipped, 0);
+
+    // Append turn_context in Batch 2 (NO forceFullRescan!)
+    appendFileSync(
+      lateModelFile,
+      JSON.stringify({ timestamp: '2026-11-22T09:20:05Z', type: 'turn_context', payload: { model: 'gpt-6.2-sol' } }) + '\n',
+      'utf-8',
+    );
+    // Also add compressed twin of natRevert to prove `_<rolloutId>` deduplicates across .jsonl -> .jsonl.zst
+    const natRevertZst = h.mkCodexRollout(
+      '2026/11/22',
+      `rollout-2026-11-22T09-05-00-${natThreadId}_${natRolloutId}.jsonl.zst`,
+    );
+    writeFileSync(natRevertZst, zlib.zstdCompressSync(Buffer.from(natRevertContent, 'utf-8')));
+
+    syncAllSources({ dataDir: h.dataDir });
+    const rep = buildReport({ dataDir: h.dataDir, rangeDays: 0, timeZone: 'UTC' });
+
+    const hugeSess = rep.sessions.find((s) => s.sessionId === hugeId);
+    assert.equal(hugeSess.steps, 2);
+    assert.equal(hugeSess.total, 3_300);
+
+    // Native `<threadId>_<rolloutId>` MUST group into `natThreadId`, NOT create a separate `natRolloutId` session
+    assert.equal(rep.sessions.find((s) => s.sessionId === natRolloutId), undefined);
+    const natSess = rep.sessions.find((s) => s.sessionId === natThreadId);
+    assert.equal(natSess.steps, 2);
+    assert.equal(natSess.total, 7_700);
+
+    // Nested parent_thread_id extracted
+    const cursors = JSON.parse(readFileSync(join(h.dataDir, 'cursors.json'), 'utf-8'));
+    assert.equal(cursors.sessions[`codex:${nestedChildId}`].parentSessionId, natThreadId);
+
+    // Cross-batch late turn_context backfilled without needing sync --full
+    const lateSess = rep.sessions.find((s) => s.sessionId === lateModelId);
+    assert.equal(lateSess.primaryModel, 'gpt-6.2-sol');
+    assert.equal(lateSess.unpricedSteps, 0);
+
+    // Lowering TOKEN_METER_MAX_ZSTD_BYTES below hugeFile's size MUST report skippedFiles and preserve existing events
+    process.env.TOKEN_METER_MAX_ZSTD_BYTES = String(1024 * 1024);
+    const cappedSync = syncAllSources({ dataDir: h.dataDir, forceFullRescan: true });
+    assert.equal(cappedSync.skipped, 1);
+    assert.equal(cappedSync.skippedFiles[0].filePath, hugeFile);
+    const repAfterCap = buildReport({ dataDir: h.dataDir, rangeDays: 0, timeZone: 'UTC' });
+    assert.equal(repAfterCap.sessions.find((s) => s.sessionId === hugeId)?.total, 3_300);
+    delete process.env.TOKEN_METER_MAX_ZSTD_BYTES;
+
+    // 5. Legacy v2.0.0 ledger upgrade (parent + forked child with ghost `parentId:tc:2` key + deleted archived session)
+    const upgEnv = createTestEnv('atm-codex-upg-');
+    try {
+      const pId = '71717171-7171-7171-7171-717171717171';
+      const cId = '72727272-7272-7272-7272-727272727272';
+      const delId = '73737373-7373-7373-7373-737373737373';
+      const pFile = upgEnv.mkCodexRollout('2026/11/22', `rollout-2026-11-22T10-00-00-${pId}.jsonl`);
+      const cFile = upgEnv.mkCodexRollout('2026/11/22', `rollout-2026-11-22T10-01-00-${cId}.jsonl`);
+
+      writeFileSync(
+        pFile,
+        [
+          JSON.stringify({ timestamp: '2026-11-22T10:00:00Z', type: 'session_meta', payload: { id: pId } }),
+          JSON.stringify({ timestamp: '2026-11-22T10:00:01Z', type: 'turn_context', payload: { model: 'gpt-6-luna' } }),
+          JSON.stringify({
+            timestamp: '2026-11-22T10:00:02Z',
+            type: 'event_msg',
+            payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 90, output_tokens: 10 } } },
+          }),
+        ].join('\n') + '\n',
+        'utf-8',
+      );
+      writeFileSync(
+        cFile,
+        [
+          JSON.stringify({
+            timestamp: '2026-11-22T10:01:00Z',
+            type: 'session_meta',
+            payload: { id: cId, forked_from_id: pId },
+          }),
+          JSON.stringify({ timestamp: '2026-11-22T10:01:01Z', type: 'session_meta', payload: { id: pId } }),
+          JSON.stringify({ timestamp: '2026-11-22T10:01:02Z', type: 'turn_context', payload: { model: 'gpt-6-luna' } }),
+          JSON.stringify({
+            timestamp: '2026-11-22T10:01:03Z',
+            type: 'event_msg',
+            payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 200, output_tokens: 20 } } },
+          }),
+          JSON.stringify({
+            timestamp: '2026-11-22T10:01:04Z',
+            type: 'event_msg',
+            payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 290, output_tokens: 30 } } },
+          }),
+        ].join('\n') + '\n',
+        'utf-8',
+      );
+
+      // Seed v2.0.0 ledger state: both files marked up-to-date with NO parserVersion & child misattributed to pId
+      const pSt = statSync(pFile);
+      const cSt = statSync(cFile);
+      mkdirSync(join(upgEnv.dataDir, 'events'), { recursive: true });
+      writeFileSync(
+        join(upgEnv.dataDir, 'cursors.json'),
+        JSON.stringify(
+          {
+            version: 2,
+            files: {
+              [canonicalFileKey(pFile)]: {
+                agent: 'codex',
+                app: 'codex',
+                sessionId: pId,
+                size: pSt.size,
+                mtimeMs: pSt.mtimeMs,
+                ino: pSt.ino,
+                offset: pSt.size,
+                deltaSeq: 1,
+              },
+              [canonicalFileKey(cFile)]: {
+                agent: 'codex',
+                app: 'codex',
+                sessionId: pId,
+                size: cSt.size,
+                mtimeMs: cSt.mtimeMs,
+                ino: cSt.ino,
+                offset: cSt.size,
+                deltaSeq: 2,
+              },
+            },
+            sessions: {
+              [`codex:${pId}`]: { agent: 'codex', sessionId: pId, app: 'codex', lastModel: 'gpt-6-luna' },
+              [`codex:${delId}`]: { agent: 'codex', sessionId: delId, app: 'codex', title: 'Archived deleted chat' },
+            },
+          },
+          null,
+          2,
+        ),
+        'utf-8',
+      );
+      writeFileSync(
+        join(upgEnv.dataDir, 'events', '2026-11.jsonl'),
+        [
+          // Collided tc:1 (child overwrote parent) + ghost tc:2 (from child misattributed to parent)
+          JSON.stringify({ a: 'codex', c: pId, e: 'tc:1', ts: Date.parse('2026-11-22T10:01:03Z'), m: 'gpt-6-luna', k: 'T', in: 200, cr: 0, cw5: 0, cw1h: 0, out: 20, r: 0 }),
+          JSON.stringify({ a: 'codex', c: pId, e: 'tc:2', ts: Date.parse('2026-11-22T10:01:04Z'), m: 'gpt-6-luna', k: 'T', in: 90, cr: 0, cw5: 0, cw1h: 0, out: 10, r: 0 }),
+          // Genuinely archived event from a deleted transcript -> MUST survive upgrade AND --full
+          JSON.stringify({ a: 'codex', c: delId, e: 'tc:1', ts: Date.parse('2026-11-20T10:00:00Z'), m: 'gpt-6-luna', k: 'T', in: 500, cr: 0, cw5: 0, cw1h: 0, out: 50, r: 0 }),
+        ].join('\n') + '\n',
+        'utf-8',
+      );
+
+      // Normal sync MUST auto-upgrade cursors, purge ghost pId:tc:2, and preserve deleted session
+      syncAllSources({ dataDir: upgEnv.dataDir });
+      let uRep = buildReport({ dataDir: upgEnv.dataDir, rangeDays: 0, timeZone: 'UTC' });
+      assert.equal(uRep.sessions.find((s) => s.sessionId === pId)?.steps, 1);
+      assert.equal(uRep.sessions.find((s) => s.sessionId === pId)?.total, 100);
+      assert.equal(uRep.sessions.find((s) => s.sessionId === cId)?.steps, 2);
+      assert.equal(uRep.sessions.find((s) => s.sessionId === cId)?.total, 320);
+      assert.equal(uRep.sessions.find((s) => s.sessionId === delId)?.total, 550);
+      assert.equal(uRep.allTime.totalEvents, 4); // 1 parent + 2 child + 1 archived deleted (NOT 5!)
+
+      // Full rescan MUST produce the exact same clean totals
+      syncAllSources({ dataDir: upgEnv.dataDir, forceFullRescan: true });
+      uRep = buildReport({ dataDir: upgEnv.dataDir, rangeDays: 0, timeZone: 'UTC' });
+      assert.equal(uRep.allTime.totalEvents, 4);
+      assert.equal(uRep.period.total, 100 + 320 + 550);
+    } finally {
+      upgEnv.cleanup();
+    }
+
+    // 6. Red-team v2.0.2 upgrade & boundary closures:
+    //    (a) syncSingleSource (Hook) runs BEFORE syncAllSources on a legacy v2.0.1 native revert ledger
+    //    (b) Dynamic session_meta.id during upgrade converges & rescans unchanged live sibling
+    //    (c) Corrupt sibling .zst preserves healthy sibling's title & lastModel in state.sessions
+    //    (d) `-revert-` filename containing an underscore still extracts `<threadId>`
+    const rtEnv = createTestEnv('atm-codex-v202-rt-');
+    try {
+      const tId = '81818181-8181-8181-8181-818181818181';
+      const rId = '82828282-8282-8282-8282-828282828282';
+      const revFile = rtEnv.mkCodexRollout('2026/11/22', `rollout-2026-11-22T11-00-00-${tId}_${rId}.jsonl`);
+      writeFileSync(
+        revFile,
+        [
+          JSON.stringify({ timestamp: '2026-11-22T11:00:00Z', type: 'session_meta', payload: { id: tId } }),
+          JSON.stringify({ timestamp: '2026-11-22T11:00:01Z', type: 'turn_context', payload: { model: 'gpt-6-sol' } }),
+          JSON.stringify({
+            timestamp: '2026-11-22T11:00:02Z',
+            type: 'event_msg',
+            payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 10_000, output_tokens: 1_000 } } },
+          }),
+        ].join('\n') + '\n',
+        'utf-8',
+      );
+      const revSt = statSync(revFile);
+      mkdirSync(join(rtEnv.dataDir, 'events'), { recursive: true });
+      // Emulate v2.0.1 ledger where `_<rId>` was misattributed to sessionId = rId (no parserVersion)
+      writeFileSync(
+        join(rtEnv.dataDir, 'cursors.json'),
+        JSON.stringify(
+          {
+            version: 2,
+            files: {
+              [canonicalFileKey(revFile)]: {
+                agent: 'codex',
+                app: 'codex',
+                sessionId: rId,
+                size: revSt.size,
+                mtimeMs: revSt.mtimeMs,
+                ino: revSt.ino,
+                offset: revSt.size,
+                deltaSeq: 1,
+              },
+            },
+            sessions: {
+              [`codex:${rId}`]: { agent: 'codex', sessionId: rId, app: 'codex', lastModel: 'gpt-6-sol' },
+            },
+          },
+          null,
+          2,
+        ),
+        'utf-8',
+      );
+      writeFileSync(
+        join(rtEnv.dataDir, 'events', '2026-11.jsonl'),
+        JSON.stringify({ a: 'codex', c: rId, e: 'tc:1', ts: Date.parse('2026-11-22T11:00:02Z'), m: 'gpt-6-sol', k: 'T', in: 10_000, cr: 0, cw5: 0, cw1h: 0, out: 1_000, r: 0 }) + '\n',
+        'utf-8',
+      );
+
+      // (a) Hook triggers syncSingleSource FIRST, then syncAllSources runs -> MUST clean up ghost rId with zero double-count!
+      syncSingleSource(revFile, { agent: 'codex', dataDir: rtEnv.dataDir });
+      syncAllSources({ dataDir: rtEnv.dataDir });
+      let rtRep = buildReport({ dataDir: rtEnv.dataDir, rangeDays: 0, timeZone: 'UTC' });
+      assert.equal(rtRep.sessions.length, 1);
+      assert.equal(rtRep.sessions[0].sessionId, tId);
+      assert.equal(rtRep.period.total, 11_000);
+
+      // (b) Dynamic session_meta.id on a legacy non-UUID file colliding with already-upgraded unchanged sibling
+      const dynSib = rtEnv.mkCodexRollout('2026/11/22', 'rollout-legacy-revert-r2.jsonl');
+      writeFileSync(
+        dynSib,
+        [
+          JSON.stringify({ timestamp: '2026-11-22T11:05:00Z', type: 'session_meta', payload: { id: tId } }),
+          JSON.stringify({ timestamp: '2026-11-22T11:05:01Z', type: 'turn_context', payload: { model: 'gpt-6-sol' } }),
+          JSON.stringify({
+            timestamp: '2026-11-22T11:05:02Z',
+            type: 'event_msg',
+            payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 2_000, output_tokens: 200 } } },
+          }),
+        ].join('\n') + '\n',
+        'utf-8',
+      );
+      const dynSt = statSync(dynSib);
+      const curNow = JSON.parse(readFileSync(join(rtEnv.dataDir, 'cursors.json'), 'utf-8'));
+      curNow.files[canonicalFileKey(dynSib)] = {
+        agent: 'codex',
+        app: 'codex',
+        sessionId: 'rollout-legacy-revert-r2',
+        size: dynSt.size,
+        mtimeMs: dynSt.mtimeMs,
+        ino: dynSt.ino,
+        offset: dynSt.size,
+        deltaSeq: 1,
+      };
+      writeFileSync(join(rtEnv.dataDir, 'cursors.json'), JSON.stringify(curNow, null, 2), 'utf-8');
+      syncAllSources({ dataDir: rtEnv.dataDir });
+      rtRep = buildReport({ dataDir: rtEnv.dataDir, rangeDays: 0, timeZone: 'UTC' });
+      // MUST preserve BOTH revFile (11,000) AND dynSib (2,200) = 13,200 (2 steps)!
+      assert.equal(rtRep.sessions.find((s) => s.sessionId === tId)?.steps, 2);
+      assert.equal(rtRep.sessions.find((s) => s.sessionId === tId)?.total, 13_200);
+
+      // (c) Healthy sibling + corrupt .zst sibling sharing same threadId -> healthy title & lastModel MUST be kept
+      const healthId = '83838383-8383-8383-8383-838383838383';
+      const healthRev = '84848484-8484-8484-8484-848484848484';
+      const healthFile = rtEnv.mkCodexRollout('2026/11/22', `rollout-2026-11-22T12-00-00-${healthId}.jsonl`);
+      writeFileSync(
+        healthFile,
+        [
+          JSON.stringify({ timestamp: '2026-11-22T12:00:00Z', type: 'session_meta', payload: { id: healthId } }),
+          JSON.stringify({ timestamp: '2026-11-22T12:00:01Z', type: 'turn_context', payload: { model: 'gpt-6.1-sol' } }),
+          JSON.stringify({ timestamp: '2026-11-22T12:00:02Z', type: 'event_msg', payload: { type: 'user_message', message: 'Healthy Title' } }),
+          JSON.stringify({
+            timestamp: '2026-11-22T12:00:03Z',
+            type: 'event_msg',
+            payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 1_000, output_tokens: 100 } } },
+          }),
+        ].join('\n') + '\n',
+        'utf-8',
+      );
+      const corruptSib = rtEnv.mkCodexRollout(
+        '2026/11/22',
+        `rollout-2026-11-22T12-05-00-${healthId}_${healthRev}.jsonl.zst`,
+      );
+      writeFileSync(corruptSib, Buffer.from('corrupt-zst-payload'));
+      const corRes = syncAllSources({ dataDir: rtEnv.dataDir, forceFullRescan: true });
+      assert.equal(corRes.skipped, 1);
+      const curAfterCor = JSON.parse(readFileSync(join(rtEnv.dataDir, 'cursors.json'), 'utf-8'));
+      assert.equal(curAfterCor.sessions[`codex:${healthId}`]?.title, 'Healthy Title');
+      assert.equal(curAfterCor.sessions[`codex:${healthId}`]?.lastModel, 'gpt-6.1-sol');
+
+      // (d) `-revert-` filename containing an underscore still extracts threadId (not rolloutId)
+      const uTid = '85858585-8585-8585-8585-858585858585';
+      const uRid = '86868686-8686-8686-8686-868686868686';
+      const uFile = rtEnv.mkCodexRollout(
+        '2026/11/22',
+        `rollout-2026-11-22T12-10-00-${uTid}-revert-${uRid}_copy.jsonl`,
+      );
+      writeFileSync(
+        uFile,
+        [
+          JSON.stringify({ timestamp: '2026-11-22T12:10:00Z', type: 'session_meta', payload: { id: uTid } }),
+          JSON.stringify({ timestamp: '2026-11-22T12:10:01Z', type: 'turn_context', payload: { model: 'gpt-6-luna' } }),
+          JSON.stringify({
+            timestamp: '2026-11-22T12:10:02Z',
+            type: 'event_msg',
+            payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 500, output_tokens: 50 } } },
+          }),
+        ].join('\n') + '\n',
+        'utf-8',
+      );
+      syncAllSources({ dataDir: rtEnv.dataDir });
+      const uRep2 = buildReport({ dataDir: rtEnv.dataDir, rangeDays: 0, timeZone: 'UTC' });
+      assert.equal(uRep2.sessions.find((s) => s.sessionId === uTid)?.total, 550);
+    } finally {
+      rtEnv.cleanup();
+    }
   } finally {
     h.cleanup();
   }
