@@ -81,18 +81,27 @@ export function safeStat(filePath) {
 }
 
 /**
- * Shared recursive `.jsonl` collector (no symlink traversal, bounded depth).
+ * Shared recursive log collector (no symlink traversal, bounded depth).
+ * Defaults to `.jsonl`; callers may pass custom suffixes such as `['.jsonl', '.jsonl.zst']`.
  */
-export function collectJsonlFiles(dir, maxDepth, onFile, depth = 0) {
+export function collectJsonlFiles(dir, maxDepth, onFile, options = {}, depth = 0) {
+  if (typeof options === 'number') {
+    return collectJsonlFiles(dir, maxDepth, onFile, {}, options);
+  }
+  const extensions =
+    Array.isArray(options?.extensions) && options.extensions.length > 0 ? options.extensions : ['.jsonl'];
   if (depth > maxDepth) return;
   for (const entry of safeReaddirWithTypes(dir)) {
     if (!entry.name || entry.name.startsWith('.')) continue;
     const full = join(dir, entry.name);
     if (!isNotSymlink(full)) continue;
-    if (entry.isFile() && entry.name.endsWith('.jsonl')) {
-      onFile(full);
+    if (entry.isFile()) {
+      const lower = entry.name.toLowerCase();
+      if (extensions.some((ext) => lower.endsWith(ext))) {
+        onFile(full);
+      }
     } else if (entry.isDirectory()) {
-      collectJsonlFiles(full, maxDepth, onFile, depth + 1);
+      collectJsonlFiles(full, maxDepth, onFile, options, depth + 1);
     }
   }
 }

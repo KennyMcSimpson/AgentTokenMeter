@@ -5,17 +5,28 @@
  * Automatically detects the calling host from the stdin JSON payload:
  * - Antigravity: camelCase `transcriptPath`, `conversationId`
  * - Claude Code: snake_case `transcript_path`, `agent_transcript_path`, `session_id`
- * - Codex:       snake_case `transcript_path`, `session_id`, `turn_id`
+ * - Codex:       snake_case `transcript_path`, `agent_transcript_path`, `session_id`, `turn_id`
  *
  * Always prints `{}\n` and exits 0 so it never blocks any agent turn loop.
  */
 import { readFileSync } from 'node:fs';
-import { detectAdapterForPath } from '../adapters/index.mjs';
+import { detectAdapterForPath, normalizeAgentId } from '../adapters/index.mjs';
 import { canonicalFileKey } from '../core/fs-utils.mjs';
 import { syncSingleSource } from '../core/sync.mjs';
 
 function isSubagentPath(p) {
   return /[/\\]subagents[/\\][^/\\]+\.jsonl$/i.test(String(p || ''));
+}
+
+function resolveSnakeCaseHost(payload, filePath, fallbackAgent = '') {
+  const explicit = normalizeAgentId(payload.agent);
+  if (explicit) {
+    return explicit;
+  }
+  if (typeof payload.turn_id === 'string' && payload.turn_id.trim()) {
+    return 'codex';
+  }
+  return detectAdapterForPath(filePath)?.id || fallbackAgent;
 }
 
 function collectTargets(payload) {
@@ -31,24 +42,20 @@ function collectTargets(payload) {
     });
   }
 
-  // Claude Code SubagentStop hook
+  // Claude Code or Codex SubagentStop hook
   if (typeof payload.agent_transcript_path === 'string' && payload.agent_transcript_path.trim()) {
+    const filePath = payload.agent_transcript_path.trim();
     targets.push({
-      filePath: payload.agent_transcript_path.trim(),
-      agent: 'claude-code',
+      filePath,
+      agent: resolveSnakeCaseHost(payload, filePath, ''),
       sessionId: '',
     });
   }
 
-  // Claude Code or Codex Stop hook
+  // Claude Code or Codex Stop / SubagentStop hook
   if (typeof payload.transcript_path === 'string' && payload.transcript_path.trim()) {
     const filePath = payload.transcript_path.trim();
-    const explicitAgent =
-      typeof payload.agent === 'string' && payload.agent
-        ? payload.agent
-        : payload.turn_id !== undefined
-          ? 'codex'
-          : detectAdapterForPath(filePath)?.id || '';
+    const explicitAgent = resolveSnakeCaseHost(payload, filePath, '');
     targets.push({
       filePath,
       agent: explicitAgent,

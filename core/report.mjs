@@ -156,7 +156,7 @@ export function buildReport({
   const allTimeAcc = emptyBucket();
   const todayAcc = emptyBucket();
   const periodAcc = emptyBucket();
-  const activeSessionAcc = emptyBucket();
+  const activeAccByAgent = new Map();
 
   const dailyMap = new Map();
   const modelMap = new Map();
@@ -242,7 +242,12 @@ export function buildReport({
       accumulate(todayAcc, e, cost);
     }
     if (activeSessionId && e.c === activeSessionId) {
-      accumulate(activeSessionAcc, e, cost);
+      let activeAcc = activeAccByAgent.get(e.a);
+      if (!activeAcc) {
+        activeAcc = emptyBucket();
+        activeAccByAgent.set(e.a, activeAcc);
+      }
+      accumulate(activeAcc, e, cost);
     }
 
     if (!inPeriod) continue;
@@ -366,6 +371,47 @@ export function buildReport({
     })
     .sort((a, b) => b.costUsd - a.costUsd || b.total - a.total);
 
+  let activeSession = null;
+  if (activeSessionId) {
+    const canIncludeSession = (s) =>
+      Boolean(s) && allowedSet.has(s.agent) && (agentFilter === 'all' || s.agent === agentFilter);
+    let targetAgent = '';
+    if (agentFilter !== 'all') {
+      if (allowedSet.has(agentFilter)) targetAgent = agentFilter;
+    } else if (activeAccByAgent.size > 0) {
+      if (activeAccByAgent.has('antigravity')) {
+        targetAgent = 'antigravity';
+      } else {
+        targetAgent = allowedList.find((id) => activeAccByAgent.has(id)) || activeAccByAgent.keys().next().value || '';
+      }
+    } else {
+      const agMeta = sessions[sessionKey('antigravity', activeSessionId)];
+      if (canIncludeSession(agMeta)) {
+        targetAgent = 'antigravity';
+      } else {
+        const matchedMeta = Object.values(sessions).find(
+          (s) => s.sessionId === activeSessionId && canIncludeSession(s),
+        );
+        if (matchedMeta) targetAgent = matchedMeta.agent;
+      }
+    }
+
+    if (targetAgent) {
+      const acc = activeAccByAgent.get(targetAgent) || null;
+      const metaCandidate = sessions[sessionKey(targetAgent, activeSessionId)] || null;
+      const meta = canIncludeSession(metaCandidate) ? metaCandidate : null;
+      if (meta || (acc && acc.steps > 0)) {
+        activeSession = {
+          sessionId: activeSessionId,
+          convId: activeSessionId,
+          agent: targetAgent,
+          title: meta?.title || '',
+          ...finalizeBucket(acc || emptyBucket()),
+        };
+      }
+    }
+  }
+
   const sessionList = Array.from(sessionMap.values())
     .map((s) => {
       let primaryModel = 'unknown';
@@ -381,25 +427,12 @@ export function buildReport({
         ...finalizeBucket(rest),
         primaryModel,
         primaryModelLabel: formatModelLabel(primaryModel),
-        isCurrent: Boolean(activeSessionId && s.sessionId === activeSessionId),
+        isCurrent: Boolean(
+          activeSession && s.sessionId === activeSession.sessionId && s.agent === activeSession.agent,
+        ),
       };
     })
     .sort((a, b) => b.costUsd - a.costUsd || b.lastTs - a.lastTs);
-
-  let activeSession = null;
-  if (activeSessionId) {
-    const meta =
-      sessions[sessionKey(agentFilter === 'all' ? 'antigravity' : agentFilter, activeSessionId)] ||
-      Object.values(sessions).find((s) => s.sessionId === activeSessionId) ||
-      null;
-    activeSession = {
-      sessionId: activeSessionId,
-      convId: activeSessionId,
-      agent: meta?.agent || (agentFilter === 'all' ? 'antigravity' : agentFilter),
-      title: meta?.title || '',
-      ...finalizeBucket(activeSessionAcc),
-    };
-  }
 
   const availableAgents = AGENT_IDS.filter((id) => availableAgentSet.has(id));
   for (const id of availableAgentSet) {

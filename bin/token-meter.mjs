@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { readFileSync } from 'node:fs';
 import { atomicWriteFile } from '../core/fs-utils.mjs';
+import { supportsZstd } from '../core/jsonl-reader.mjs';
 import { getDataDir, listOfficialRateCard, loadPrefs, savePrefs } from '../core/pricing.mjs';
 import { buildReport, exportDailyCsv, normalizeAgentFilter } from '../core/report.mjs';
 import { syncAllSources, syncSingleSource } from '../core/sync.mjs';
@@ -130,6 +131,11 @@ function cmdSummary(flags) {
   if (report.period.unpricedSteps > 0) {
     console.log(
       `Note: ${report.period.unpricedSteps} step(s) used unlisted models (marked unpriced; add custom rates in pricing.override.json).`,
+    );
+  }
+  if (!supportsZstd() && (report.agentFilter === 'all' || report.agentFilter === 'codex')) {
+    console.log(
+      `Note: Node.js ${process.version} lacks built-in zstd decompression; compressed Codex .jsonl.zst archives were skipped (requires Node.js >=22.15.0).`,
     );
   }
 

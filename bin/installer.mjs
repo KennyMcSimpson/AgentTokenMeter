@@ -20,7 +20,7 @@ function isOurHookCommand(cmd, repoRoot = REPO_ROOT) {
   const norm = normCmd(cmd);
   const expectedScript = normCmd(join(repoRoot, 'hooks', 'record.mjs'));
   if (norm.includes(expectedScript)) return true;
-  return norm.includes('hooks/record.mjs') && norm.includes('token-meter');
+  return norm.includes('hooks/record.mjs') && (norm.includes('token-meter') || norm.includes('tokenmeter'));
 }
 
 function isOurStatusLineCommand(cmd, repoRoot = REPO_ROOT) {
@@ -95,10 +95,18 @@ function removeHookEvent(hooksObj, eventName, repoRoot) {
   return removed;
 }
 
-function buildCodexWindowsPowerShellCmd(nodeCmd) {
-  // Codex executes `commandWindows` under PowerShell on Windows;
-  // `--%` stops PowerShell from mangling quotes/operators before handing off to cmd.exe.
-  return `cmd.exe --% /d /s /c "cd . && ${nodeCmd}"`;
+const CODEX_TRUST_NOTE =
+  'Codex 0.171+ requires reviewing and trusting new user hooks before they run automatically. Approve the AgentTokenMeter Stop hook in Codex TUI (/hooks) or Desktop Hooks settings; until trusted, running `summary` or `serve` still syncs logs automatically.';
+
+function buildCodexHooksFile(cfg, existingHooks) {
+  // Codex Rust HooksFile uses #[serde(deny_unknown_fields)]:
+  // top-level allows only optional `description` and `hooks`.
+  const next = {};
+  if (typeof cfg.description === 'string') {
+    next.description = cfg.description;
+  }
+  next.hooks = existingHooks;
+  return next;
 }
 
 export function installTarget(target, { dryRun = false, force = false, allAgents = false, repoRoot = REPO_ROOT } = {}) {
@@ -112,7 +120,7 @@ export function installTarget(target, { dryRun = false, force = false, allAgents
     const path = resolveClaudeSettingsPath();
     const cfg = readStrictJsonObject(path);
     const next = structuredClone(cfg);
-    if (!next.hooks || typeof next.hooks !== 'object') next.hooks = {};
+    if (!next.hooks || typeof next.hooks !== 'object' || Array.isArray(next.hooks)) next.hooks = {};
     const entry = { type: 'command', command: recordCmd, timeout: 10 };
     upsertHookEvent(next.hooks, 'Stop', entry, repoRoot);
     upsertHookEvent(next.hooks, 'SubagentStop', entry, repoRoot);
@@ -142,22 +150,23 @@ export function installTarget(target, { dryRun = false, force = false, allAgents
   if (target === 'codex' || target === 'codex-hooks') {
     const path = resolveCodexHooksPath();
     const cfg = readStrictJsonObject(path);
-    // Codex Rust HooksFile uses #[serde(deny_unknown_fields)]: top-level MUST only contain `hooks`.
-    const existingHooks = cfg.hooks && typeof cfg.hooks === 'object' ? structuredClone(cfg.hooks) : {};
+    const existingHooks =
+      cfg.hooks && typeof cfg.hooks === 'object' && !Array.isArray(cfg.hooks) ? structuredClone(cfg.hooks) : {};
+    // Codex executes `command` via `%COMSPEC% /C` on Windows and `sh -c` on Unix,
+    // so a plain quoted `command` works cross-platform without `commandWindows`.
     upsertHookEvent(
       existingHooks,
       'Stop',
       {
         type: 'command',
         command: recordCmd,
-        commandWindows: buildCodexWindowsPowerShellCmd(recordCmd),
         timeout: 10,
       },
       repoRoot,
     );
-    const next = { hooks: existingHooks };
+    const next = buildCodexHooksFile(cfg, existingHooks);
     if (!dryRun) atomicWriteJson(path, next);
-    return { target: 'codex-hooks', path, dryRun, config: next };
+    return { target: 'codex-hooks', path, dryRun, config: next, note: CODEX_TRUST_NOTE };
   }
 
   throw new Error(`Unknown install target "${target}". Supported: claude, statusline, codex`);
@@ -170,7 +179,7 @@ export function uninstallTarget(target, { dryRun = false, repoRoot = REPO_ROOT }
     const cfg = readStrictJsonObject(path);
     const next = structuredClone(cfg);
     let changed = false;
-    if (next.hooks && typeof next.hooks === 'object') {
+    if (next.hooks && typeof next.hooks === 'object' && !Array.isArray(next.hooks)) {
       changed = removeHookEvent(next.hooks, 'Stop', repoRoot) || changed;
       changed = removeHookEvent(next.hooks, 'SubagentStop', repoRoot) || changed;
       if (Object.keys(next.hooks).length === 0) delete next.hooks;
@@ -197,9 +206,10 @@ export function uninstallTarget(target, { dryRun = false, repoRoot = REPO_ROOT }
     const path = resolveCodexHooksPath();
     if (!existsSync(path)) return { target: 'codex-hooks', path, changed: false, dryRun };
     const cfg = readStrictJsonObject(path);
-    const existingHooks = cfg.hooks && typeof cfg.hooks === 'object' ? structuredClone(cfg.hooks) : {};
+    const existingHooks =
+      cfg.hooks && typeof cfg.hooks === 'object' && !Array.isArray(cfg.hooks) ? structuredClone(cfg.hooks) : {};
     const changed = removeHookEvent(existingHooks, 'Stop', repoRoot);
-    if (changed && !dryRun) atomicWriteJson(path, { hooks: existingHooks });
+    if (changed && !dryRun) atomicWriteJson(path, buildCodexHooksFile(cfg, existingHooks));
     return { target: 'codex-hooks', path, changed, dryRun };
   }
 

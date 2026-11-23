@@ -3,7 +3,9 @@ import http from 'node:http';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
+import * as zlib from 'node:zlib';
 import { installTarget, uninstallTarget } from '../bin/installer.mjs';
+import { canonicalFileKey } from '../core/fs-utils.mjs';
 import { readJsonlDelta } from '../core/jsonl-reader.mjs';
 import { buildReport } from '../core/report.mjs';
 import { compactEventsPreservingArchived } from '../core/store.mjs';
@@ -361,6 +363,273 @@ test('Installer non-standard repo dir idempotency, same-group third-party hook p
     // Single-agent summary must NOT print `--- By Agent ---`
     const sumOut = h.runCli('summary', '--days', '0', '--agent', 'claude-code', '--no-sync');
     assert.equal(sumOut.includes('--- By Agent ---'), false);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Codex SubagentStop hook routes agent_transcript_path to codex adapter without corrupting cursors', () => {
+  const h = createTestEnv('atm-sec-codex-sub-');
+  try {
+    const parentId = '55555555-5555-5555-5555-555555555555';
+    const childId = '66666666-6666-6666-6666-666666666666';
+    const parentRollout = h.mkCodexRollout('2026/11/23', `rollout-2026-11-23T14-00-00-${parentId}.jsonl`);
+    const childRollout = h.mkCodexRollout('2026/11/23', `rollout-2026-11-23T14-01-00-${childId}.jsonl`);
+
+    writeFileSync(
+      parentRollout,
+      [
+        JSON.stringify({ timestamp: '2026-11-23T14:00:00Z', type: 'session_meta', payload: { id: parentId } }),
+        JSON.stringify({ timestamp: '2026-11-23T14:00:01Z', type: 'turn_context', payload: { model: 'gpt-6.1-sol' } }),
+        JSON.stringify({
+          timestamp: '2026-11-23T14:00:05Z',
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 10_000, output_tokens: 500 } } },
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+
+    writeFileSync(
+      childRollout,
+      [
+        JSON.stringify({
+          timestamp: '2026-11-23T14:01:00Z',
+          type: 'session_meta',
+          payload: { id: childId, parent_thread_id: parentId },
+        }),
+        JSON.stringify({ timestamp: '2026-11-23T14:01:01Z', type: 'turn_context', payload: { model: 'gpt-6-luna' } }),
+        JSON.stringify({
+          timestamp: '2026-11-23T14:01:05Z',
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 4_000, cached_input_tokens: 2_000, output_tokens: 200 } } },
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+
+    // Codex SubagentStop schema: agent_id, agent_type, agent_transcript_path, transcript_path, session_id, turn_id
+    const hookOut = h.runHook({
+      agent_id: 'sub-explorer-1',
+      agent_type: 'explorer',
+      agent_transcript_path: childRollout,
+      transcript_path: parentRollout,
+      session_id: parentId,
+      turn_id: 'turn-99',
+    });
+    assert.equal(hookOut.trim(), '{}');
+
+    // Both cursors MUST belong to codex (never misrouted to claude-code)
+    const cursors = JSON.parse(readFileSync(join(h.dataDir, 'cursors.json'), 'utf-8'));
+    const cursorEntries = Object.values(cursors.files);
+    assert.equal(cursorEntries.length, 2);
+    assert.ok(cursorEntries.every((c) => c.agent === 'codex'));
+
+    // Subsequent incremental sync must remain accurate with zero missing or duplicate events
+    syncAllSources({ dataDir: h.dataDir });
+    const rep = buildReport({ dataDir: h.dataDir, rangeDays: 0, agent: 'codex', timeZone: 'UTC' });
+    assert.equal(rep.allTime.totalEvents, 2);
+    assert.equal(rep.sessions.length, 2);
+    assert.equal(rep.period.total, 14_700);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('Red-team security & boundary guards: truncated .zst, role-name/null turn_id hooks, mismatched cursor recovery, same-ID cross-agent activeSession, and installer AgentTokenMeter/array hooks', () => {
+  const h = createTestEnv('atm-sec-rt-');
+  try {
+    // 1. Truncated .zst (both with Frame_Content_Size and streaming multi-block without FCS) MUST return null
+    const bigJson = `${JSON.stringify({ x: 'a'.repeat(16_000) })}\n`;
+    const compressed = zlib.zstdCompressSync(Buffer.from(bigJson, 'utf-8'));
+    const truncFile = join(h.root, 'truncated.jsonl.zst');
+    writeFileSync(truncFile, compressed.subarray(0, Math.min(80, Math.floor(compressed.length / 2))));
+    assert.equal(readJsonlDelta(truncFile, null, false), null);
+
+    // Streaming multi-block zstd frame omitting Frame_Content_Size (ZSTD_c_contentSizeFlag = 0)
+    const streamingPayload = Buffer.from(
+      Array.from({ length: 3000 }, (_, i) => JSON.stringify({ i, hash: ((i * 2654435761) >>> 0).toString(16), pad: 'z'.repeat(80) })).join('\n') + '\n',
+      'utf-8',
+    );
+    const streamCompressed = zlib.zstdCompressSync(streamingPayload, {
+      params: { [zlib.constants.ZSTD_c_contentSizeFlag]: 0 },
+    });
+    const streamFullFile = join(h.root, 'streaming-full.jsonl.zst');
+    writeFileSync(streamFullFile, streamCompressed);
+    const streamFullRes = readJsonlDelta(streamFullFile, null, false);
+    assert.ok(streamFullRes && streamFullRes.records.length === 3000);
+
+    const streamTruncFile = join(h.root, 'streaming-trunc.jsonl.zst');
+    writeFileSync(streamTruncFile, streamCompressed.subarray(0, Math.floor(streamCompressed.length * 0.6)));
+    assert.equal(readJsonlDelta(streamTruncFile, null, false), null);
+
+    // 2. Hook with non-host `agent: 'explorer'` + valid `turn_id` MUST still route to codex
+    const cxId = '45454545-4545-4545-4545-454545454545';
+    const cxFile = h.mkCodexRollout('2026/11/23', `rollout-2026-11-23T16-00-00-${cxId}.jsonl`);
+    writeFileSync(
+      cxFile,
+      [
+        JSON.stringify({ timestamp: '2026-11-23T16:00:00Z', type: 'session_meta', payload: { id: cxId } }),
+        JSON.stringify({ timestamp: '2026-11-23T16:00:01Z', type: 'turn_context', payload: { model: 'gpt-6-luna' } }),
+        JSON.stringify({
+          timestamp: '2026-11-23T16:00:02Z',
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 1_000, output_tokens: 100 } } },
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+    assert.equal(
+      h.runHook({ agent: 'explorer', turn_id: 'turn-1', agent_transcript_path: cxFile }).trim(),
+      '{}',
+    );
+
+    // 3. Hook with `turn_id: null` on Claude Code subagent MUST route to claude-code (NOT codex)
+    const ccSub = h.mkClaudeTranscript('proj-rt', 'parent-cc', 'agent-nullturn');
+    writeFileSync(
+      ccSub,
+      JSON.stringify({
+        type: 'assistant',
+        sessionId: 'parent-cc',
+        isSidechain: true,
+        requestId: 'r_nt',
+        timestamp: '2026-11-23T16:01:00Z',
+        message: { id: 'm_nt', model: 'claude-haiku-4-5', usage: { input_tokens: 500, output_tokens: 50 } },
+      }) + '\n',
+      'utf-8',
+    );
+    assert.equal(
+      h.runHook({ turn_id: null, session_id: 'parent-cc', agent_transcript_path: ccSub }).trim(),
+      '{}',
+    );
+
+    // 4. Stale cursor written under wrong adapter MUST be discarded and rescanned cleanly
+    const healId = '56565656-5656-5656-5656-565656565656';
+    const healFile = h.mkCodexRollout('2026/11/23', `rollout-2026-11-23T16-05-00-${healId}.jsonl`);
+    writeFileSync(
+      healFile,
+      [
+        JSON.stringify({ timestamp: '2026-11-23T16:05:00Z', type: 'session_meta', payload: { id: healId } }),
+        JSON.stringify({ timestamp: '2026-11-23T16:05:01Z', type: 'turn_context', payload: { model: 'gpt-6-luna' } }),
+        JSON.stringify({
+          timestamp: '2026-11-23T16:05:02Z',
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 3_000, output_tokens: 300 } } },
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+    const cursorsPath = join(h.dataDir, 'cursors.json');
+    const st = readFileSync(healFile);
+    const cursors = JSON.parse(readFileSync(cursorsPath, 'utf-8'));
+    cursors.files[canonicalFileKey(healFile)] = {
+      agent: 'claude-code',
+      size: st.length,
+      mtimeMs: 0,
+      offset: st.length,
+    };
+    writeFileSync(cursorsPath, JSON.stringify(cursors, null, 2), 'utf-8');
+    const healRes = syncSingleSource(healFile, { agent: 'codex', dataDir: h.dataDir });
+    assert.equal(healRes.added, 1);
+
+    const repHooks = buildReport({ dataDir: h.dataDir, rangeDays: 0, timeZone: 'UTC' });
+    assert.equal(repHooks.sessions.find((s) => s.sessionId === cxId)?.total, 1_100);
+    assert.equal(repHooks.sessions.find((s) => s.sessionId === 'parent-cc:agent-nullturn')?.total, 550);
+    assert.equal(repHooks.sessions.find((s) => s.sessionId === healId)?.total, 3_300);
+
+    // 5. Same sessionId across two agents under agent='all' MUST NOT merge totals or mislabel ghost meta
+    const sharedSid = 'shared-collision-sid';
+    const agShared = h.mkAgTranscript(sharedSid);
+    writeFileSync(
+      agShared,
+      JSON.stringify({
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-11-23T16:10:00Z',
+        model: 'gemini-4-neon-xhigh',
+        input_tokens: 1_000,
+        cache_read_tokens: 0,
+        output_tokens: 100,
+      }) + '\n',
+      'utf-8',
+    );
+    const cxShared = h.mkCodexRollout('2026/11/23', `rollout-2026-11-23T16-10-00-${sharedSid}.jsonl`);
+    writeFileSync(
+      cxShared,
+      [
+        JSON.stringify({ timestamp: '2026-11-23T16:10:00Z', type: 'session_meta', payload: { id: sharedSid } }),
+        JSON.stringify({ timestamp: '2026-11-23T16:10:01Z', type: 'turn_context', payload: { model: 'gpt-6-luna' } }),
+        JSON.stringify({
+          timestamp: '2026-11-23T16:10:02Z',
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 5_000, output_tokens: 500 } } },
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+    // Ghost empty AG metadata vs real Codex events on `ghost-sid`
+    const ghostSid = 'ghost-meta-sid';
+    const cxGhost = h.mkCodexRollout('2026/11/23', `rollout-2026-11-23T16-15-00-${ghostSid}.jsonl`);
+    writeFileSync(
+      cxGhost,
+      [
+        JSON.stringify({ timestamp: '2026-11-23T16:15:00Z', type: 'session_meta', payload: { id: ghostSid } }),
+        JSON.stringify({ timestamp: '2026-11-23T16:15:01Z', type: 'turn_context', payload: { model: 'gpt-6-luna' } }),
+        JSON.stringify({
+          timestamp: '2026-11-23T16:15:02Z',
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 2_000, output_tokens: 200 } } },
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+    syncAllSources({ dataDir: h.dataDir });
+    const cur2 = JSON.parse(readFileSync(cursorsPath, 'utf-8'));
+    cur2.sessions[`antigravity:${ghostSid}`] = { agent: 'antigravity', sessionId: ghostSid, title: 'AG Ghost' };
+    writeFileSync(cursorsPath, JSON.stringify(cur2, null, 2), 'utf-8');
+
+    const repShared = buildReport({ dataDir: h.dataDir, rangeDays: 0, agent: 'all', activeSessionId: sharedSid, timeZone: 'UTC' });
+    assert.equal(repShared.activeSession.agent, 'antigravity');
+    assert.equal(repShared.activeSession.steps, 1);
+    assert.equal(repShared.activeSession.total, 1_100);
+    assert.equal(repShared.sessions.filter((s) => s.isCurrent).length, 1);
+
+    const repGhost = buildReport({ dataDir: h.dataDir, rangeDays: 0, agent: 'all', activeSessionId: ghostSid, timeZone: 'UTC' });
+    assert.equal(repGhost.activeSession.agent, 'codex');
+    assert.equal(repGhost.activeSession.steps, 1);
+    assert.equal(repGhost.activeSession.total, 2_200);
+
+    // 6. Installer: cross-path uninstall of default `AgentTokenMeter` folder & malformed `hooks: []` recovery
+    const codexHooksPath = join(h.codexDir, 'hooks.json');
+    writeFileSync(
+      codexHooksPath,
+      JSON.stringify({
+        hooks: {
+          Stop: [
+            {
+              hooks: [
+                {
+                  type: 'command',
+                  command: 'node "C:\\Users\\Dev\\AgentTokenMeter\\hooks\\record.mjs"',
+                  commandWindows: 'cmd.exe --% /d /s /c "cd . && node \\"C:\\Users\\Dev\\AgentTokenMeter\\hooks\\record.mjs\\""',
+                },
+              ],
+            },
+          ],
+        },
+      }),
+      'utf-8',
+    );
+    const crossUn = uninstallTarget('codex', { repoRoot: join(h.root, 'other-dir') });
+    assert.equal(crossUn.changed, true);
+
+    writeFileSync(codexHooksPath, JSON.stringify({ description: 'Arr', hooks: [] }), 'utf-8');
+    installTarget('codex');
+    const fixedCodex = JSON.parse(readFileSync(codexHooksPath, 'utf-8'));
+    assert.equal(fixedCodex.description, 'Arr');
+    assert.equal(Array.isArray(fixedCodex.hooks), false);
+    assert.equal(fixedCodex.hooks.Stop.length, 1);
   } finally {
     h.cleanup();
   }

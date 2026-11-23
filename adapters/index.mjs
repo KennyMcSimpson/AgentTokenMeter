@@ -70,7 +70,7 @@ const CLAUDE_TYPES = new Set([
   'queue-operation',
   'progress',
 ]);
-const CODEX_TYPES = new Set(['session_meta', 'turn_context', 'event_msg', 'response_item']);
+const CODEX_TYPES = new Set(['session_meta', 'turn_context', 'event_msg', 'response_item', 'token_usage_record']);
 const AG_TYPES = new Set(['USER_INPUT', 'PLANNER_RESPONSE', 'SYSTEM_MESSAGE', 'CHECKPOINT']);
 
 function classifyObject(obj) {
@@ -115,7 +115,7 @@ function sniffAdapterFromContent(filePath) {
     }
 
     // Fallback for oversized first lines (>64KB) truncated mid-JSON
-    if (/"type"\s*:\s*"(?:session_meta|turn_context|event_msg|response_item)"/.test(sample)) {
+    if (/"type"\s*:\s*"(?:session_meta|turn_context|event_msg|response_item|token_usage_record)"/.test(sample)) {
       return codexAdapter;
     }
     if (/"step_index"\s*:|"type"\s*:\s*"(?:USER_INPUT|PLANNER_RESPONSE|SYSTEM_MESSAGE|CHECKPOINT)"/.test(sample)) {

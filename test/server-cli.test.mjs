@@ -160,17 +160,32 @@ test('Installer & uninstaller: dry-run, idempotency, preserving third-party hook
     installTarget('statusline', { force: true, allAgents: true });
     assert.ok(JSON.parse(readFileSync(ccSettings, 'utf-8')).statusLine.command.includes('statusline --agent all'));
 
-    // Codex hooks: top-level MUST only contain `hooks` (deny_unknown_fields) and include commandWindows
+    // Codex hooks: top-level allows only optional `description` + `hooks` (deny_unknown_fields),
+    // omits redundant commandWindows, preserves description & third-party hooks, and returns trust note.
     const codexHooksPath = join(h.codexDir, 'hooks.json');
     assert.equal(existsSync(codexHooksPath), false);
+    writeFileSync(
+      codexHooksPath,
+      JSON.stringify({
+        description: 'User Codex hooks',
+        hooks: {
+          SessionStart: [{ hooks: [{ type: 'command', command: 'echo codex-user-hook' }] }],
+        },
+      }),
+      'utf-8',
+    );
+    const codexInstall = installTarget('codex');
     installTarget('codex');
-    installTarget('codex');
+    assert.ok(typeof codexInstall.note === 'string' && codexInstall.note.includes('/hooks'));
     const afterCodex = JSON.parse(readFileSync(codexHooksPath, 'utf-8'));
-    assert.deepEqual(Object.keys(afterCodex), ['hooks']);
+    assert.deepEqual(Object.keys(afterCodex).sort(), ['description', 'hooks']);
+    assert.equal(afterCodex.description, 'User Codex hooks');
+    assert.equal(afterCodex.hooks.SessionStart.length, 1);
     assert.equal(afterCodex.hooks.Stop.length, 1);
-    assert.ok(afterCodex.hooks.Stop[0].hooks[0].commandWindows.includes('cmd.exe --%'));
+    assert.equal(afterCodex.hooks.Stop[0].hooks[0].commandWindows, undefined);
+    assert.ok(afterCodex.hooks.Stop[0].hooks[0].command.includes('record.mjs'));
 
-    // Uninstall removes only our entries, preserving user hooks
+    // Uninstall removes only our entries, preserving user hooks & Codex description
     uninstallTarget('claude');
     uninstallTarget('statusline');
     uninstallTarget('codex');
@@ -179,7 +194,33 @@ test('Installer & uninstaller: dry-run, idempotency, preserving third-party hook
     assert.equal(finalCc.hooks.Stop, undefined);
     assert.equal(finalCc.statusLine, undefined);
     const finalCodex = JSON.parse(readFileSync(codexHooksPath, 'utf-8'));
-    assert.deepEqual(finalCodex, { hooks: {} });
+    assert.equal(finalCodex.description, 'User Codex hooks');
+    assert.equal(finalCodex.hooks.SessionStart.length, 1);
+    assert.equal(finalCodex.hooks.Stop, undefined);
+
+    // Legacy uninstall compatibility: old configs with `commandWindows` still uninstall cleanly
+    writeFileSync(
+      codexHooksPath,
+      JSON.stringify({
+        hooks: {
+          Stop: [
+            {
+              hooks: [
+                {
+                  type: 'command',
+                  command: 'echo legacy-fallback',
+                  commandWindows: 'cmd.exe --% /d /s /c "cd . && node \\"C:\\token-meter\\hooks\\record.mjs\\""',
+                },
+              ],
+            },
+          ],
+        },
+      }),
+      'utf-8',
+    );
+    const legacyUn = uninstallTarget('codex');
+    assert.equal(legacyUn.changed, true);
+    assert.deepEqual(JSON.parse(readFileSync(codexHooksPath, 'utf-8')), { hooks: {} });
   } finally {
     h.cleanup();
   }
@@ -263,6 +304,21 @@ test('Single-agent isolation on pre-populated shared ledger: lockedAgent, TOKEN_
     assert.deepEqual(lockedRep.agents.map((a) => a.agent), ['claude-code']);
     assert.equal(lockedRep.allTime.totalEvents, 1);
     assert.equal(lockedRep.sessions[0].agent, 'claude-code');
+
+    // Cross-agent activeSession isolation: querying a foreign sessionId MUST return null (never leak foreign agent/title)
+    const foreignActiveRep = await (
+      await fetch(`${srvLocked.url}/api/report?days=0&agent=all&sessionId=ag-iso-1&tz=UTC`)
+    ).json();
+    assert.equal(foreignActiveRep.activeSession, null);
+    const foreignCodexRep = await (
+      await fetch(`${srvLocked.url}/api/report?days=0&agent=claude-code&sessionId=cx-iso-1&tz=UTC`)
+    ).json();
+    assert.equal(foreignCodexRep.activeSession, null);
+    const ownActiveRep = await (
+      await fetch(`${srvLocked.url}/api/report?days=0&agent=claude-code&sessionId=cc-iso-1&tz=UTC`)
+    ).json();
+    assert.equal(ownActiveRep.activeSession.agent, 'claude-code');
+    assert.equal(ownActiveRep.activeSession.steps, 1);
 
     const lockedCsv = await (await fetch(`${srvLocked.url}/api/export.csv?days=0&agent=all&tz=UTC`)).text();
     assert.ok(lockedCsv.includes(',claude-code,'));

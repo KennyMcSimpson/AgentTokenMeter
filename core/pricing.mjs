@@ -130,7 +130,7 @@ const ALLOWED_SUFFIX_TOKENS = new Set([
  * Strict official-rule suffix guard:
  * Matches exact slugs or safe release/date/effort/context/cloud suffixes
  * (`-20260514`, `-2025-08-07`, `-high`, `-preview-05-06`, `-v1:0`, `-001`, `[1m]`),
- * while rejecting unknown minor versions (`claude-opus-4.9`, `gpt-5.5`) and distinct product tiers (`o3-pro`, `gpt-5-pro`, `o3-mini`).
+ * while rejecting unknown minor versions (`claude-opus-4.9`, `gpt-5.9`) and distinct product tiers (`o3-pro`, `gpt-5-pro`, `o3-mini`).
  */
 function officialRuleMatches(key, pfx) {
   if (key === pfx) return true;

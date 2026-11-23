@@ -51,7 +51,10 @@ export function syncSingleSource(
     dataDir,
     () => {
       const state = readCursorsState(dataDir);
-      const res = adapter.scanDelta(filePath, state.files[fileKey], meta, false);
+      const prevCursor = state.files[fileKey];
+      const effectiveCursor =
+        prevCursor && prevCursor.agent && prevCursor.agent !== adapter.id ? null : prevCursor;
+      const res = adapter.scanDelta(filePath, effectiveCursor, meta, false);
       if (!res || res.unchanged) {
         return { agent: adapter.id, added: 0, scanned: 1 };
       }
@@ -103,7 +106,10 @@ export function syncAllSources({ forceFullRescan = false, agents = null, dataDir
 
       for (const { adapter, item } of discovered) {
         const fileKey = canonicalFileKey(item.filePath);
-        const res = adapter.scanDelta(item.filePath, state.files[fileKey], item, forceFullRescan);
+        const prevCursor = state.files[fileKey];
+        const effectiveCursor =
+          prevCursor && prevCursor.agent && prevCursor.agent !== adapter.id ? null : prevCursor;
+        const res = adapter.scanDelta(item.filePath, effectiveCursor, item, forceFullRescan);
         if (!res || res.unchanged) continue;
         changedFiles += 1;
         for (const e of res.events) newEvents.push(e);

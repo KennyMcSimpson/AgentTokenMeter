@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.0.1 — Codex 0.171 Compatibility, Archive Coverage & Pricing Accuracy
+
+### Fixed
+- **Codex Forked/Subagent Rollout Key Collisions**: Lock each rollout file to its first matching `session_meta` (persisted via `sessionMetaSeen` in cursors) and populate `parentSessionId` from `parent_thread_id` / `forked_from_id`, preventing copied parent `session_meta` entries from colliding with parent event keys; disambiguate `-revert-<rolloutId>` filenames from `<threadId>`.
+- **Codex Delayed Replay & `token_usage_record` Support**: Guard against delayed replays of previously seen `total_token_usage` snapshots and prefer per-request `token_usage_record.usage` when present.
+- **Codex Compressed & Archived History Coverage**: Scan both `$CODEX_HOME/sessions/` and `$CODEX_HOME/archived_sessions/` for `.jsonl` and `.jsonl.zst` files (using built-in Node.js `>=22.15.0` `node:zlib` zstd decompression), deduplicating across `.jsonl` → `.jsonl.zst` transitions and adding first `turn_context` model lookahead.
+- **Codex `cache_write_input_tokens` Normalization**: Subtract `cache_write_input_tokens` from inclusive `input_tokens` and record it under `cw5`.
+- **Cross-Agent `activeSession` Isolation**: Restrict `buildReport()` `activeSession` lookup to the allowed/filtered agent scope and return `null` when unmatched instead of leaking foreign session metadata.
+- **Codex `SubagentStop` Hook Routing**: Infer host from `turn_id` / path instead of hardcoding `claude-code` for `agent_transcript_path`.
+- **Codex Installer Polish**: Preserve optional top-level `description` in `hooks.json` on install/uninstall, drop redundant `commandWindows` (while still cleaning up legacy entries on uninstall), and surface a clear Codex 0.171+ hook trust approval reminder in installer output and README.
+
+### Added
+- **OpenAI Official Rate Card & `>272K` Long-Context Tiering**: Added verified official rates for `gpt-6-astra`, `gpt-6-sol`, `gpt-6.1-terra`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, and `gpt-5.5`, plus `>272K` long-context pricing (`2x` input/cache, `1.5x` output) across extended-context GPT-5.4 / GPT-5.5 / GPT-5.6 / GPT-6.x models.
+
 ## 2.0.0 — AgentTokenMeter Multi-Agent Release
 
 ### Added

@@ -27,10 +27,10 @@
 - **Exact Per-Agent Accounting (No Double-Counting)**:
   - **Antigravity**: Disjoint `input_tokens` / `cache_read_tokens`, torn-line protection, Swarm/Subagent titles, and parent model inheritance.
   - **Claude Code**: Streaming `(message.id, requestId)` last-write-wins deduplication, `subagents/agent-*.jsonl` isolation, and 5-minute (`1.25x`) vs 1-hour (`2.0x`) `cache_creation` pricing tiers.
-  - **Codex**: Cumulative `total_token_usage` delta deduplication (eliminating duplicate snapshot inflation), inclusive-to-disjoint `cached_input_tokens` subtraction, `reasoning_output_tokens` subset tracking, and `turn_context` model resolution.
-- **Zero Dependencies & 100% Local**: Pure Node.js ESM (`>=22`). No `npm install`, no telemetry, no external network calls. Only normalized numeric metrics and short session titles are persisted under `~/.agent-token-meter/` (never raw message bodies).
+  - **Codex**: Cumulative `total_token_usage` delta & `token_usage_record` accounting (preventing duplicate/delayed-replay inflation), forked/subagent `session_meta` isolation, revert rollout disambiguation, `.jsonl.zst` compressed & `archived_sessions/` scanning, inclusive-to-disjoint `cached_input_tokens` / `cache_write_input_tokens` normalization, `reasoning_output_tokens` subset tracking, and `turn_context` model lookahead.
+- **Zero Dependencies & 100% Local**: Pure Node.js ESM (`>=22.15.0`, using built-in `node:zlib` zstd for compressed Codex archives). No `npm install`, no telemetry, no external network calls. Only normalized numeric metrics and short session titles are persisted under `~/.agent-token-meter/` (never raw message bodies).
 - **Persistent Archive Ledger**: Monthly NDJSON ledger (`events/YYYY-MM.jsonl`) with cross-process file locking and Windows-safe atomic rewrites. Historical usage survives even if original transcripts are later cleaned up.
-- **Multi-Provider Official Pricing + Custom Overrides**: Declarative official rate cards for **Google Gemini**, **Anthropic Claude**, and **OpenAI GPT / Codex** in `core/rate-card.mjs`, strict suffix matching (preventing mispricing of future minor versions/tiers), honest `unpriced` marking for unknown models, and optional `<dataDir>/pricing.override.json` for custom models or channel multipliers.
+- **Multi-Provider Official Pricing + Custom Overrides**: Declarative official rate cards for **Google Gemini**, **Anthropic Claude**, and **OpenAI GPT / Codex** (including `>200K` Gemini/Claude and `>272K` OpenAI long-context tiers) in `core/rate-card.mjs`, strict suffix matching (preventing mispricing of future minor versions/tiers), honest `unpriced` marking for unknown models, and optional `<dataDir>/pricing.override.json` for custom models or channel multipliers.
 
 ---
 
@@ -71,7 +71,7 @@ node bin/token-meter.mjs install statusline
 
 ### 3. Codex
 
-Clone the repository and optionally wire the non-destructive `Stop` hook (strictly compliant with Codex `hooks.json` schema and Windows `commandWindows`):
+Clone the repository and optionally wire the non-destructive `Stop` hook (strictly compliant with Codex `hooks.json` schema, preserving any existing `description` and third-party hooks):
 
 ```bash
 git clone https://github.com/KennyMcSimpson/AgentTokenMeter.git ~/AgentTokenMeter
@@ -82,7 +82,7 @@ node bin/token-meter.mjs install codex --dry-run
 node bin/token-meter.mjs install codex
 ```
 
-> Hooks are optional accelerators — even without installing any hook, `summary` and `serve` perform fast incremental scans across all enabled agent logs.
+> **Codex 0.171+ Hook Trust Requirement**: Codex treats newly added user hooks as untrusted until you explicitly approve them. Open `/hooks` in Codex TUI (or the Hooks settings panel in Codex Desktop) and trust the AgentTokenMeter `Stop` hook so it runs automatically at the end of each turn. The installer deliberately never auto-writes trust hashes. Even before approving the hook, `summary` and `serve` perform fast incremental scans across both `$CODEX_HOME/sessions/` and `$CODEX_HOME/archived_sessions/` (including `.jsonl.zst` archives).
 
 ### 4. Standalone Local Web Dashboard (Single-Agent or Combined)
 
@@ -147,7 +147,7 @@ node bin/token-meter.mjs uninstall codex
 | `TOKEN_METER_DEFAULT_AGENT` | Override default initial view in the Antigravity sidecar (`antigravity` by default) |
 | `TOKEN_METER_BRAIN_ROOTS` | Override Antigravity brain roots (`:` / `;` separated; empty string disables scan) |
 | `TOKEN_METER_CLAUDE_ROOTS` | Override Claude Code project roots (defaults to `$CLAUDE_CONFIG_DIR/projects` or `~/.claude/projects`) |
-| `TOKEN_METER_CODEX_ROOTS` | Override Codex session roots (defaults to `$CODEX_HOME/sessions` or `~/.codex/sessions`) |
+| `TOKEN_METER_CODEX_ROOTS` | Override Codex session roots (defaults to `$CODEX_HOME/sessions` and `$CODEX_HOME/archived_sessions`) |
 
 Create `<dataDir>/pricing.override.json` to add custom models or apply channel/proxy multipliers:
 

@@ -1,6 +1,6 @@
 {
   "name": "agent-token-meter",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "AgentTokenMeter: Zero-dependency local token usage, prompt cache analytics, and multi-provider official API cost tracker for Antigravity, Claude Code, and Codex.",
   "skills": "./skills/",
   "interface": {

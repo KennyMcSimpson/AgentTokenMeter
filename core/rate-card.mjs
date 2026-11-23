@@ -12,6 +12,7 @@
 
 const DEC_1_2026_UTC = Date.UTC(2026, 11, 1, 0, 0, 0);
 const JAN_1_2027_UTC = Date.UTC(2027, 0, 1, 0, 0, 0);
+const LONG_CTX_272K = 272_000;
 const LONG_CTX_200K = 200_000;
 const LONG_CTX_100K = 100_000;
 
@@ -39,6 +40,18 @@ function flatRates(input, cacheRead, output, tierNote = 'Official standard tier'
     output,
     tierNote,
   };
+}
+
+function openaiTiered272k(input, cacheRead, output, cacheLabel = '90% cache discount') {
+  return ({ promptTotal }) =>
+    promptTotal > LONG_CTX_272K
+      ? flatRates(
+          roundRate(input * 2),
+          roundRate(cacheRead * 2),
+          roundRate(output * 1.5),
+          'OpenAI official long-context (>272K)',
+        )
+      : flatRates(input, cacheRead, output, `OpenAI official (${cacheLabel}; <=272K / >272K tiered)`);
 }
 
 export const OFFICIAL_PRICING_RULES = [
@@ -261,31 +274,73 @@ export const OFFICIAL_PRICING_RULES = [
     provider: 'openai',
     prefix: 'gpt-6.2-astra',
     family: 'GPT-6.2 Astra',
-    resolve: () => flatRates(8.0, 0.4, 40.0, 'OpenAI official (95% cache discount)'),
+    resolve: openaiTiered272k(8.0, 0.4, 40.0, '95% cache discount'),
+  },
+  {
+    provider: 'openai',
+    prefix: 'gpt-6-astra',
+    family: 'GPT-6 Astra',
+    resolve: openaiTiered272k(10.0, 1.0, 50.0, '90% cache discount'),
   },
   {
     provider: 'openai',
     prefix: 'gpt-6.2-sol',
     family: 'GPT-6.2 Sol',
-    resolve: () => flatRates(2.0, 0.1, 10.0, 'OpenAI official (95% cache discount)'),
+    resolve: openaiTiered272k(2.0, 0.1, 10.0, '95% cache discount'),
   },
   {
     provider: 'openai',
     prefix: 'gpt-6.1-sol',
     family: 'GPT-6.1 Sol',
-    resolve: () => flatRates(2.0, 0.1, 10.0, 'OpenAI official (95% cache discount)'),
+    resolve: openaiTiered272k(2.0, 0.1, 10.0, '95% cache discount'),
+  },
+  {
+    provider: 'openai',
+    prefix: 'gpt-6-sol',
+    family: 'GPT-6 Sol',
+    resolve: openaiTiered272k(2.0, 0.1, 10.0, '95% cache discount'),
+  },
+  {
+    provider: 'openai',
+    prefix: 'gpt-6.1-terra',
+    family: 'GPT-6.1 Terra',
+    resolve: openaiTiered272k(1.0, 0.05, 5.0, '95% cache discount'),
   },
   {
     provider: 'openai',
     prefix: 'gpt-6-luna',
     family: 'GPT-6 Luna',
-    resolve: () => flatRates(0.1, 0.01, 0.5, 'OpenAI official (90% cache discount)'),
+    resolve: openaiTiered272k(0.1, 0.01, 0.5, '90% cache discount'),
+  },
+  {
+    provider: 'openai',
+    prefix: 'gpt-5.6-sol',
+    family: 'GPT-5.6 Sol',
+    resolve: openaiTiered272k(4.0, 0.4, 20.0, '90% cache discount'),
+  },
+  {
+    provider: 'openai',
+    prefix: 'gpt-5.6-terra',
+    family: 'GPT-5.6 Terra',
+    resolve: openaiTiered272k(2.0, 0.2, 12.0, '90% cache discount'),
+  },
+  {
+    provider: 'openai',
+    prefix: 'gpt-5.6-luna',
+    family: 'GPT-5.6 Luna',
+    resolve: openaiTiered272k(0.2, 0.02, 1.2, '90% cache discount'),
+  },
+  {
+    provider: 'openai',
+    prefix: 'gpt-5.5',
+    family: 'GPT-5.5',
+    resolve: openaiTiered272k(5.0, 0.5, 30.0, '90% cache discount'),
   },
   {
     provider: 'openai',
     prefix: 'gpt-5.4',
     family: 'GPT-5.4',
-    resolve: () => flatRates(2.5, 0.25, 15.0, 'OpenAI official (90% cache discount)'),
+    resolve: openaiTiered272k(2.5, 0.25, 15.0, '90% cache discount'),
   },
   {
     provider: 'openai',

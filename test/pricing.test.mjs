@@ -9,6 +9,8 @@ import {
   normalizeModel,
   resolveModelRate,
 } from '../core/pricing.mjs';
+import { buildReport } from '../core/report.mjs';
+import { syncAllSources } from '../core/sync.mjs';
 import { createTestEnv } from './helpers.mjs';
 
 test('Google Gemini pricing: intro-to-standard date transitions and >200K long-context tiers', () => {
@@ -142,7 +144,8 @@ test('Model normalization, strict suffix guard, nested routing prefixes, and lab
     'claude-opus-4.9',
     'claude-opus-4-2',
     'claude-sonnet-5.9',
-    'gpt-5.5',
+    'gpt-5.9',
+    'gpt-5.5-pro',
     'gpt-5.3',
     'gpt-5-pro',
     'gpt-5.4-pro',
@@ -201,5 +204,78 @@ test('pricing.override.json malformed non-numeric values never poison costs with
     assert.equal(Number.isFinite(cost.cacheSaved), true);
   } finally {
     env.cleanup();
+  }
+});
+
+test('OpenAI GPT-6 / GPT-5.6 / GPT-5.5 official rates and >272K long-context tiering', () => {
+  const cases = [
+    ['gpt-6.2-astra', 8.0, 0.4, 40.0],
+    ['gpt-6-astra', 10.0, 1.0, 50.0],
+    ['gpt-6.2-sol', 2.0, 0.1, 10.0],
+    ['gpt-6.1-sol', 2.0, 0.1, 10.0],
+    ['gpt-6-sol', 2.0, 0.1, 10.0],
+    ['gpt-6.1-terra', 1.0, 0.05, 5.0],
+    ['gpt-6-luna', 0.1, 0.01, 0.5],
+    ['gpt-5.6-sol', 4.0, 0.4, 20.0],
+    ['gpt-5.6-terra', 2.0, 0.2, 12.0],
+    ['gpt-5.6-luna', 0.2, 0.02, 1.2],
+    ['gpt-5.5', 5.0, 0.5, 30.0],
+    ['gpt-5.4', 2.5, 0.25, 15.0],
+  ];
+
+  for (const [model, inp, cr, out] of cases) {
+    const std = resolveModelRate(model, { promptTotal: 272_000 });
+    assert.equal(std.matchType, 'official', `${model} should match official`);
+    assert.equal(std.provider, 'openai');
+    assert.equal(std.input, inp, `${model} standard input`);
+    assert.equal(std.cacheRead, cr, `${model} standard cacheRead`);
+    assert.equal(std.output, out, `${model} standard output`);
+
+    const longCtx = resolveModelRate(model, { promptTotal: 272_001 });
+    assert.equal(longCtx.input, Math.round(inp * 2 * 10_000) / 10_000, `${model} >272K input`);
+    assert.equal(longCtx.cacheRead, Math.round(cr * 2 * 10_000) / 10_000, `${model} >272K cacheRead`);
+    assert.equal(longCtx.output, Math.round(out * 1.5 * 10_000) / 10_000, `${model} >272K output`);
+  }
+
+  // Verify end-to-end report pricing uses inclusive promptTotal (in + cr + cw5) for >272K check
+  const h = createTestEnv('atm-272k-');
+  try {
+    const rollout = h.mkCodexRollout(
+      '2026/11/23',
+      'rollout-2026-11-23T09-00-00-44444444-4444-4444-4444-444444444444.jsonl',
+    );
+    writeFileSync(
+      rollout,
+      [
+        JSON.stringify({
+          timestamp: '2026-11-23T09:00:00Z',
+          type: 'session_meta',
+          payload: { id: '44444444-4444-4444-4444-444444444444' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-11-23T09:00:01Z',
+          type: 'turn_context',
+          payload: { model: 'gpt-6.1-sol' },
+        }),
+        JSON.stringify({
+          timestamp: '2026-11-23T09:00:05Z',
+          type: 'event_msg',
+          payload: {
+            type: 'token_count',
+            info: {
+              // Inclusive input = 280,000 (>272K) -> uncached 30k @ $4/M + cached 250k @ $0.20/M + output 10k @ $15/M
+              total_token_usage: { input_tokens: 280_000, cached_input_tokens: 250_000, output_tokens: 10_000 },
+            },
+          },
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+    syncAllSources({ dataDir: h.dataDir });
+    const rep = buildReport({ dataDir: h.dataDir, rangeDays: 0, timeZone: 'UTC' });
+    // Expected: 0.03 * 4 + 0.25 * 0.2 + 0.01 * 15 = 0.12 + 0.05 + 0.15 = $0.32
+    assert.equal(Number(rep.period.costUsd.toFixed(6)), 0.32);
+  } finally {
+    h.cleanup();
   }
 });
