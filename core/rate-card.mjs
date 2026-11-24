@@ -170,9 +170,27 @@ export const OFFICIAL_PRICING_RULES = [
   // ======================== Anthropic Claude ========================
   {
     provider: 'anthropic',
+    prefix: 'claude-fable-5-2',
+    family: 'Claude Fable 5.2',
+    resolve: () => claudeRates(8.0, 40.0, 0.025, 'Anthropic official (97.5% cache read)'),
+  },
+  {
+    provider: 'anthropic',
+    prefix: 'claude-fable-5-1',
+    family: 'Claude Fable 5.1',
+    resolve: () => claudeRates(10.0, 50.0, 0.025, 'Anthropic official (97.5% cache read)'),
+  },
+  {
+    provider: 'anthropic',
     prefix: 'claude-opus-5-5',
     family: 'Claude Opus 5.5',
     resolve: () => claudeRates(4.0, 20.0, 0.05, 'Anthropic official (95% cache read)'),
+  },
+  {
+    provider: 'anthropic',
+    prefix: 'claude-opus-5',
+    family: 'Claude Opus 5',
+    resolve: () => claudeRates(5.0, 25.0, 0.1),
   },
   {
     provider: 'anthropic',

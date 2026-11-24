@@ -286,3 +286,88 @@ test('OpenAI GPT-6 / GPT-5.6 / GPT-5.5 official rates, 1.25x cache write, and >2
     h.cleanup();
   }
 });
+
+test('v2.0.4 pricing: tiered suffix matches official Gemini 4 Hydrogen and memoization honors dynamic ts/promptTotal/overrides', () => {
+  const tiered = resolveModelRate('gemini-4-hydrogen-tiered-high');
+  assert.equal(tiered.matchType, 'official');
+  assert.equal(tiered.provider, 'google');
+  assert.equal(tiered.matchedRule, 'gemini-4-hydrogen');
+  assert.equal(tiered.input, 1.5);
+  assert.equal(tiered.cacheRead, 0.075);
+  assert.equal(tiered.output, 7.5);
+
+  // Repeated calls for the same slug must still respect dynamic ts, promptTotal, and custom overrides
+  const intro = resolveModelRate('gemini-4-carbon', { ts: Date.UTC(2026, 10, 24) });
+  const std = resolveModelRate('gemini-4-carbon', { ts: Date.UTC(2026, 11, 1) });
+  assert.equal(intro.input, 2.0);
+  assert.equal(std.input, 4.0);
+
+  const shortCtx = resolveModelRate('gpt-6.2-sol', { promptTotal: 272_000 });
+  const longCtx = resolveModelRate('gpt-6.2-sol', { promptTotal: 272_001 });
+  assert.equal(shortCtx.input, 2.0);
+  assert.equal(longCtx.input, 4.0);
+
+  const custom = resolveModelRate('gemini-4-hydrogen-tiered-high', {
+    overrides: {
+      multipliers: {},
+      models: { 'gemini-4-hydrogen': { input: 9.0, cacheRead: 1.0, output: 18.0 } },
+    },
+  });
+  assert.equal(custom.matchType, 'custom');
+  assert.equal(custom.input, 9.0);
+  // Subsequent call without overrides must return official rate cleanly
+  const backToOfficial = resolveModelRate('gemini-4-hydrogen-tiered-high');
+  assert.equal(backToOfficial.matchType, 'official');
+  assert.equal(backToOfficial.input, 1.5);
+});
+
+test('v2.1.0 pricing: Claude Opus 5 / Fable 5.1 & 5.2 official rates, Fast 2x, Flex 0.5x, and US residency 1.1x', () => {
+  const opus5 = resolveModelRate('claude-opus-5');
+  assert.equal(opus5.matchType, 'official');
+  assert.equal(opus5.provider, 'anthropic');
+  assert.equal(opus5.input, 5.0);
+  assert.equal(opus5.cacheRead, 0.5);
+  assert.equal(opus5.cacheWrite5m, 6.25);
+  assert.equal(opus5.cacheWrite1h, 10.0);
+  assert.equal(opus5.output, 25.0);
+
+  const fable51 = resolveModelRate('claude-fable-5-1');
+  assert.equal(fable51.matchType, 'official');
+  assert.equal(fable51.input, 10.0);
+  assert.equal(fable51.cacheRead, 0.25);
+  assert.equal(fable51.cacheWrite5m, 12.5);
+  assert.equal(fable51.cacheWrite1h, 20.0);
+  assert.equal(fable51.output, 50.0);
+
+  const fable52 = resolveModelRate('claude-fable-5-2');
+  assert.equal(fable52.matchType, 'official');
+  assert.equal(fable52.input, 8.0);
+  assert.equal(fable52.cacheRead, 0.2);
+  assert.equal(fable52.cacheWrite5m, 10.0);
+  assert.equal(fable52.cacheWrite1h, 16.0);
+  assert.equal(fable52.output, 40.0);
+
+  // Anthropic Fast mode (2x) + US data residency (1.1x) stack cleanly
+  const fableFast = resolveModelRate('claude-fable-5-2', { serviceTier: 'fast' });
+  assert.equal(fableFast.input, 16.0);
+  assert.equal(fableFast.cacheRead, 0.4);
+  assert.equal(fableFast.output, 80.0);
+  assert.match(fableFast.tierNote, /fast 2x/);
+
+  const fableFastUs = resolveModelRate('claude-fable-5-2', { serviceTier: 'fast', inferenceGeo: 'us' });
+  assert.equal(fableFastUs.input, 17.6);
+  assert.equal(fableFastUs.output, 88.0);
+
+  // OpenAI Priority/Fast (2x) and Flex (0.5x)
+  const solFast = resolveModelRate('gpt-6.2-sol', { serviceTier: 'priority', promptTotal: 100_000 });
+  assert.equal(solFast.input, 4.0);
+  assert.equal(solFast.cacheRead, 0.2);
+  assert.equal(solFast.output, 20.0);
+  assert.match(solFast.tierNote, /fast 2x/);
+
+  const solFlex = resolveModelRate('gpt-6.2-sol', { serviceTier: 'flex', promptTotal: 100_000 });
+  assert.equal(solFlex.input, 1.0);
+  assert.equal(solFlex.cacheRead, 0.05);
+  assert.equal(solFlex.output, 5.0);
+  assert.match(solFlex.tierNote, /flex 0\.5x/);
+});

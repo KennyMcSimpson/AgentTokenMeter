@@ -5,6 +5,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -39,6 +40,21 @@ export function isPidDead(pid) {
 export function canonicalFileKey(filePath) {
   const abs = resolve(String(filePath || ''));
   return process.platform === 'win32' ? abs.toLowerCase() : abs;
+}
+
+/**
+ * Canonical real-path key (resolving symlinks/junctions) for root-directory deduplication,
+ * so a symlinked `~/.codex -> /path/to/codex-home` is never scanned twice while distinct
+ * multi-account directories are both discovered.
+ */
+export function canonicalRealKey(filePath) {
+  let target = String(filePath || '');
+  try {
+    target = realpathSync(target);
+  } catch {
+    target = resolve(target);
+  }
+  return process.platform === 'win32' ? target.toLowerCase() : target;
 }
 
 export function isPathInsideRoot(filePath, rootDir) {

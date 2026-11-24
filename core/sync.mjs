@@ -1,12 +1,17 @@
 import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { detectAdapterForPath, getAdapter, getAdapters, getEnabledAgentIds } from '../adapters/index.mjs';
-import { canonicalFileKey, withLock } from './fs-utils.mjs';
+import { canonicalFileKey, canonicalRealKey, withLock } from './fs-utils.mjs';
 import { getDataDir } from './pricing.mjs';
 import {
   appendEventsByMonth,
   compactEventsPreservingArchived,
+  eventKey,
   mergeSessionMeta,
   readCursorsState,
+  readEventsFromDir,
+  readExistingEventKeys,
   sessionKey,
   writeCursorsState,
 } from './store.mjs';
@@ -219,6 +224,81 @@ export function syncSingleSource(
 }
 
 /**
+ * Non-destructive one-time import of archived Antigravity events preserved in a legacy v1
+ * `~/.gemini/token-meter` ledger (strictly read-only on the legacy directory; never overwrites
+ * existing or newly re-parsed events in `dataDir`).
+ */
+function importLegacyAntigravityLedger(dataDir, state) {
+  if (state.legacyAntigravityImported) return 0;
+
+  let legacyDir = '';
+  if (process.env.TOKEN_METER_LEGACY_AG_DIR !== undefined) {
+    legacyDir = process.env.TOKEN_METER_LEGACY_AG_DIR.trim();
+  } else {
+    const defaultDataDir = join(homedir(), '.agent-token-meter');
+    if (canonicalRealKey(dataDir) === canonicalRealKey(defaultDataDir)) {
+      legacyDir = join(homedir(), '.gemini', 'token-meter');
+    }
+  }
+
+  if (!legacyDir || !existsSync(join(legacyDir, 'events'))) {
+    return 0;
+  }
+  if (canonicalRealKey(legacyDir) === canonicalRealKey(dataDir)) {
+    state.legacyAntigravityImported = true;
+    return 0;
+  }
+
+  const existingKeys = readExistingEventKeys(dataDir);
+  const legacyEvents = readEventsFromDir(legacyDir, { filterAgent: 'antigravity' });
+  const toImport = [];
+  const importedSessionIds = new Set();
+
+  for (const e of legacyEvents) {
+    const key = eventKey(e);
+    if (existingKeys.has(key)) continue;
+    existingKeys.add(key);
+    toImport.push(e);
+    importedSessionIds.add(e.c);
+  }
+
+  if (toImport.length > 0) {
+    appendEventsByMonth(dataDir, toImport);
+    const legacyState = readCursorsState(legacyDir);
+    const copiedParents = new Set();
+    const copyLegacyMetaChain = (startSid) => {
+      let cur = startSid;
+      while (cur && !copiedParents.has(cur)) {
+        copiedParents.add(cur);
+        const sk = sessionKey('antigravity', cur);
+        const meta = legacyState.sessions[sk];
+        if (!meta) break;
+        if (!state.sessions[sk]) {
+          mergeSessionMeta(state, {
+            agent: 'antigravity',
+            sessionId: cur,
+            app: meta.app || 'antigravity',
+            title: meta.title || '',
+            parentSessionId: meta.parentSessionId || '',
+            firstModel: meta.firstModel || '',
+            lastModel: meta.lastModel || '',
+            firstTs: meta.firstTs || 0,
+            lastTs: meta.lastTs || 0,
+          });
+        }
+        cur = meta.parentSessionId || '';
+      }
+    };
+    for (const sid of importedSessionIds) {
+      copyLegacyMetaChain(sid);
+    }
+  }
+
+  state.legacyAntigravityImported = true;
+  return toImport.length;
+}
+
+/**
  * Scan all configured agent adapters and persist new token events atomically.
  * - Replaces ledger entries strictly by file-level namespace `(agent, sessionId, rolloutId)`,
  *   preserving archived events from deleted transcripts — including deleted sibling rollouts
@@ -371,6 +451,7 @@ export function syncAllSources({ forceFullRescan = false, agents = null, dataDir
         failedSessionKeys.add(sessionKey(fScope.agent, fScope.sessionId));
       }
 
+      let cursorsDirty = false;
       if (forceFullRescan || upgradedAny) {
         const { survivingSessionKeys } = compactEventsPreservingArchived(dataDir, newEvents, {
           replaceScopes,
@@ -400,11 +481,27 @@ export function syncAllSources({ forceFullRescan = false, agents = null, dataDir
           }
         }
 
-        writeCursorsState(dataDir, state);
+        cursorsDirty = true;
       } else if (changedFiles > 0) {
         if (newEvents.length) {
           appendEventsByMonth(dataDir, newEvents);
         }
+        cursorsDirty = true;
+      }
+
+      // After live Antigravity events are persisted, perform a one-time non-destructive import
+      // of any archived Antigravity sessions preserved in a legacy `~/.gemini/token-meter` ledger.
+      let legacyImported = 0;
+      const includesAntigravity = selectedAdapters.some((a) => a.id === 'antigravity');
+      if (includesAntigravity && !state.legacyAntigravityImported) {
+        const wasImported = Boolean(state.legacyAntigravityImported);
+        legacyImported = importLegacyAntigravityLedger(dataDir, state);
+        if (legacyImported > 0 || state.legacyAntigravityImported !== wasImported) {
+          cursorsDirty = true;
+        }
+      }
+
+      if (cursorsDirty) {
         writeCursorsState(dataDir, state);
       }
 
@@ -412,7 +509,8 @@ export function syncAllSources({ forceFullRescan = false, agents = null, dataDir
         totalSources: discovered.length,
         byAgent: byAgentCount,
         changedFiles,
-        added: newEvents.length,
+        added: newEvents.length + legacyImported,
+        legacyImported,
         skipped: skippedFiles.length,
         skippedFiles,
       };

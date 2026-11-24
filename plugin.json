@@ -1,7 +1,7 @@
 {
   "name": "agent-token-meter",
   "displayName": "AgentTokenMeter",
-  "version": "2.0.3",
+  "version": "2.1.0",
   "description": "Zero-dependency local token usage, cache hit rate, and multi-provider official API cost tracker across Antigravity, Claude Code, and Codex with automatic lifecycle logging and a live dashboard.",
   "logo": "assets/logo.svg",
   "author": {

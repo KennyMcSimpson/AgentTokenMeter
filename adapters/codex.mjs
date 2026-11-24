@@ -1,9 +1,15 @@
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, delimiter, join } from 'node:path';
-import { canonicalFileKey, collectJsonlFiles, isNotSymlink, isPathInsideRoot } from '../core/fs-utils.mjs';
+import {
+  canonicalRealKey,
+  collectJsonlFiles,
+  isNotSymlink,
+  isPathInsideRoot,
+  safeReaddirWithTypes,
+} from '../core/fs-utils.mjs';
 import { readJsonlDelta, truncateTitle } from '../core/jsonl-reader.mjs';
-import { normalizeModel } from '../core/pricing.mjs';
+import { normalizeModel, normalizeServiceTier } from '../core/pricing.mjs';
 import { isValidTimestamp } from '../core/store.mjs';
 
 const UUID_SRC = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
@@ -18,19 +24,21 @@ const FAST_SKIP_LINE_BYTES = 16 * 1024;
 const CODEX_EXTENSIONS = ['.jsonl', '.jsonl.zst'];
 
 // Bump when rollout identity / parsing semantics change so legacy cursors self-heal on next sync.
-export const CODEX_PARSER_VERSION = 2;
+export const CODEX_PARSER_VERSION = 3;
 
 function cleanModel(raw) {
   return typeof raw === 'string' && raw.trim() ? normalizeModel(raw) : '';
 }
 
-function normalizeDisjointUsage(stepUsage) {
+function normalizeDisjointUsage(stepUsage, { outputIncludesReasoning = true } = {}) {
   if (!stepUsage) return null;
   const crTok = Math.max(0, Math.min(stepUsage.cr, stepUsage.in));
   const cwTok = Math.max(0, Math.min(stepUsage.cw, stepUsage.in - crTok));
   const uncachedIn = Math.max(0, stepUsage.in - crTok - cwTok);
-  const outTok = Math.max(0, stepUsage.out);
-  const reasoningTok = Math.max(0, Math.min(stepUsage.r, outTok));
+  const rawOut = Math.max(0, stepUsage.out);
+  const rawR = Math.max(0, stepUsage.r);
+  const outTok = outputIncludesReasoning ? rawOut : rawOut + rawR;
+  const reasoningTok = outputIncludesReasoning ? Math.min(rawR, outTok) : rawR;
   if (uncachedIn + crTok + cwTok + outTok === 0) return null;
   return { in: uncachedIn, cr: crTok, cw5: cwTok, out: outTok, r: reasoningTok };
 }
@@ -132,21 +140,21 @@ function extractRolloutMetaFromStem(stem) {
 }
 
 function pushUniqueRoot(dir, out, seen) {
-  const key = canonicalFileKey(dir);
+  const key = canonicalRealKey(dir);
   if (seen.has(key)) return;
   seen.add(key);
   out.push(dir);
 }
 
-function addExistingRoots(baseDir, out, seen) {
+function addExistingRoots(baseDir, out, seen, { allowRootSymlink = true } = {}) {
   const sessionsDir = join(baseDir, 'sessions');
   const archivedDir = join(baseDir, 'archived_sessions');
   let addedSub = false;
-  if (existsSync(sessionsDir) && isNotSymlink(sessionsDir)) {
+  if (existsSync(sessionsDir) && (allowRootSymlink || isNotSymlink(sessionsDir))) {
     pushUniqueRoot(sessionsDir, out, seen);
     addedSub = true;
   }
-  if (existsSync(archivedDir) && isNotSymlink(archivedDir)) {
+  if (existsSync(archivedDir) && (allowRootSymlink || isNotSymlink(archivedDir))) {
     pushUniqueRoot(archivedDir, out, seen);
     addedSub = true;
   }
@@ -162,16 +170,62 @@ export function discoverCodexSessionRoots() {
     for (const entry of raw.split(delimiter)) {
       const dir = entry.trim();
       if (!dir || !existsSync(dir) || !isNotSymlink(dir)) continue;
-      if (!addExistingRoots(dir, roots, seen)) {
+      if (!addExistingRoots(dir, roots, seen, { allowRootSymlink: false })) {
         pushUniqueRoot(dir, roots, seen);
       }
     }
     return roots;
   }
 
-  const base = process.env.CODEX_HOME ? process.env.CODEX_HOME.trim() : join(homedir(), '.codex');
-  addExistingRoots(base, roots, seen);
+  // 1. Explicit CODEX_HOME (authoritative override; supports single or delimiter-separated multi-account homes)
+  if (process.env.CODEX_HOME && process.env.CODEX_HOME.trim()) {
+    for (const entry of process.env.CODEX_HOME.split(delimiter)) {
+      const dir = entry.trim();
+      if (dir && existsSync(dir)) {
+        addExistingRoots(dir, roots, seen);
+      }
+    }
+    return roots;
+  }
+
+  // 2. Default ~/.codex plus sibling multi-account homes (~/.codex-*, ~/.codex_*).
+  //    Deduplicated via `canonicalRealKey` so symlinks/junctions are never double-scanned.
+  const home = homedir();
+  const defaultBase = join(home, '.codex');
+  if (existsSync(defaultBase)) {
+    addExistingRoots(defaultBase, roots, seen);
+  }
+  for (const entry of safeReaddirWithTypes(home)) {
+    if (!entry.name) continue;
+    const low = entry.name.toLowerCase();
+    if (!low.startsWith('.codex-') && !low.startsWith('.codex_')) continue;
+    const base = join(home, entry.name);
+    if (existsSync(base)) {
+      addExistingRoots(base, roots, seen);
+    }
+  }
+
   return roots;
+}
+
+function pickTierWithPresence(...objs) {
+  let sawExplicitNull = false;
+  for (const o of objs) {
+    if (!o || typeof o !== 'object') continue;
+    if (!Object.prototype.hasOwnProperty.call(o, 'service_tier')) continue;
+    const val = o.service_tier;
+    if (val !== undefined && val !== null) {
+      if (typeof val === 'string' && !val.trim()) {
+        sawExplicitNull = true;
+        continue;
+      }
+      return { present: true, value: val };
+    }
+    if (val === null) {
+      sawExplicitNull = true;
+    }
+  }
+  return sawExplicitNull ? { present: true, value: null } : { present: false, value: undefined };
 }
 
 function extractUsageRecord(obj) {
@@ -180,19 +234,23 @@ function extractUsageRecord(obj) {
     const usage = obj.usage || payload?.usage;
     if (usage && typeof usage === 'object') {
       const rawRespId = obj.response_id || payload?.response_id || '';
+      const tierPick = pickTierWithPresence(payload, obj);
       return {
         usage,
         model: cleanModel(obj.model || payload?.model),
         responseId: typeof rawRespId === 'string' ? rawRespId.trim() : '',
+        serviceTier: tierPick.present ? tierPick.value : undefined,
       };
     }
   }
   if (obj.type === 'event_msg' && payload?.type === 'token_usage_record' && payload.usage) {
     const rawRespId = payload.response_id || obj.response_id || '';
+    const tierPick = pickTierWithPresence(payload, obj);
     return {
       usage: payload.usage,
       model: cleanModel(payload.model),
       responseId: typeof rawRespId === 'string' ? rawRespId.trim() : '',
+      serviceTier: tierPick.present ? tierPick.value : undefined,
     };
   }
   return null;
@@ -276,6 +334,7 @@ export const codexAdapter = {
     let sessionMetaSeen = false;
     let firstModel = '';
     let lastModel = '';
+    let serviceTier = '';
     let title = '';
     let firstTs = 0;
     let lastTs = 0;
@@ -365,6 +424,7 @@ export const codexAdapter = {
       sessionMetaSeen = Boolean(prev.sessionMetaSeen);
       lastModel = typeof prev.lastModel === 'string' ? prev.lastModel : '';
       firstModel = typeof prev.firstModel === 'string' && prev.firstModel ? prev.firstModel : lastModel;
+      serviceTier = normalizeServiceTier(prev.serviceTier);
       title = typeof prev.title === 'string' ? prev.title : '';
       firstTs = Number(prev.firstTs) || 0;
       lastTs = Number(prev.lastTs) || 0;
@@ -398,6 +458,7 @@ export const codexAdapter = {
         prev.lastTcEmitted && typeof prev.lastTcEmitted === 'object'
           ? {
               ts: Number(prev.lastTcEmitted.ts) || 0,
+              e: typeof prev.lastTcEmitted.e === 'string' ? prev.lastTcEmitted.e : '',
               in: Number(prev.lastTcEmitted.in) || 0,
               cr: Number(prev.lastTcEmitted.cr) || 0,
               cw5: Number(prev.lastTcEmitted.cw5) || 0,
@@ -413,6 +474,21 @@ export const codexAdapter = {
       hasUsageRecords = Boolean(prev.hasUsageRecords);
     };
 
+    const applyRawServiceTier = (raw, { allowNullReset = false } = {}) => {
+      if (raw === null) {
+        if (allowNullReset) serviceTier = '';
+        return;
+      }
+      if (typeof raw !== 'string') return;
+      const low = raw.trim().toLowerCase();
+      if (!low || low === 'default' || low === 'standard' || low === 'auto') {
+        serviceTier = '';
+        return;
+      }
+      const norm = normalizeServiceTier(low);
+      if (norm) serviceTier = norm;
+    };
+
     // Fast pre-filter for giant (>16KB) tool-output `response_item` lines in multi-hundred-MB rollouts:
     // skips expensive `JSON.parse` on irrelevant blobs while never skipping any metadata or usage line.
     const shouldParseLine = (lineBuf) => {
@@ -422,6 +498,8 @@ export const codexAdapter = {
         lineBuf.includes('token_usage_record') ||
         lineBuf.includes('turn_context') ||
         lineBuf.includes('session_meta') ||
+        lineBuf.includes('thread_settings') ||
+        lineBuf.includes('service_tier') ||
         lineBuf.includes('user_message')
       ) {
         return true;
@@ -468,6 +546,10 @@ export const codexAdapter = {
       if (obj.type === 'turn_context' && payload) {
         const m = cleanModel(payload.model || payload.collaboration_mode?.settings?.model);
         if (m) noteResolvedModel(m);
+        const tierPick = pickTierWithPresence(payload, payload.collaboration_mode?.settings);
+        if (tierPick.present) {
+          applyRawServiceTier(tierPick.value, { allowNullReset: true });
+        }
         return;
       }
 
@@ -501,8 +583,16 @@ export const codexAdapter = {
           lastTcEmitted.out === norm.out &&
           lastTcEmitted.r === norm.r
         ) {
+          const handoffEvId = lastTcEmitted.e || '';
           lastTcEmitted = null;
           if (rec.model) noteResolvedModel(rec.model);
+          if (rec.serviceTier !== undefined) {
+            applyRawServiceTier(rec.serviceTier, { allowNullReset: true });
+            if (events.length > 0 && (!handoffEvId || events[events.length - 1].e === handoffEvId)) {
+              if (serviceTier) events[events.length - 1].st = serviceTier;
+              else delete events[events.length - 1].st;
+            }
+          }
           if (rec.responseId) {
             rememberUr({ rid: rec.responseId, ts, ...norm });
           }
@@ -520,6 +610,9 @@ export const codexAdapter = {
         }
 
         if (rec.model) noteResolvedModel(rec.model);
+        if (rec.serviceTier !== undefined) {
+          applyRawServiceTier(rec.serviceTier, { allowNullReset: true });
+        }
         const model = rec.model || lastModel || 'unknown';
         deltaSeq += 1;
         const ev = {
@@ -536,6 +629,7 @@ export const codexAdapter = {
           out: norm.out,
           r: norm.r,
         };
+        if (serviceTier) ev.st = serviceTier;
         events.push(ev);
         if (model === 'unknown') {
           inBatchPendingUnknown.push(ev);
@@ -544,6 +638,15 @@ export const codexAdapter = {
       }
 
       if (obj.type !== 'event_msg' || !payload) return;
+
+      if (payload.type === 'thread_settings_applied') {
+        const tsObj = payload.thread_settings && typeof payload.thread_settings === 'object' ? payload.thread_settings : null;
+        const tierPick = pickTierWithPresence(tsObj, payload);
+        if (tierPick.present) {
+          applyRawServiceTier(tierPick.value, { allowNullReset: true });
+        }
+        return;
+      }
 
       if (!title && payload.type === 'user_message') {
         const cleaned = cleanCodexTitle(payload.message || payload.text);
@@ -560,6 +663,7 @@ export const codexAdapter = {
       const last = readUsageTuple(info.last_token_usage);
 
       let stepUsage = null;
+      let usedLastFallback = false;
       if (tot) {
         // First determine monotonic progression strictly via primary totals (`in` / `out`).
         const counterAdvanced = Boolean(
@@ -622,7 +726,12 @@ export const codexAdapter = {
             return;
           }
 
-          stepUsage = last || resetTot;
+          if (last) {
+            stepUsage = last;
+            usedLastFallback = true;
+          } else {
+            stepUsage = resetTot;
+          }
           prevTotals = resetTot;
           rememberTotal(prevTotals);
         }
@@ -635,6 +744,7 @@ export const codexAdapter = {
           return;
         }
         stepUsage = last;
+        usedLastFallback = true;
         prevLastSig = { ts, in: last.in, cr: last.cr, cw: last.cw, out: last.out, r: last.r };
       } else {
         return;
@@ -642,20 +752,27 @@ export const codexAdapter = {
 
       // OpenAI inclusive -> disjoint normalization:
       // `input_tokens` includes both `cached_input_tokens` and `cache_write_input_tokens`;
-      // `output_tokens` includes `reasoning_output_tokens`.
-      const norm = normalizeDisjointUsage(stepUsage);
+      // `output_tokens` normally includes `reasoning_output_tokens`, except when `last_token_usage`
+      // is used with explicit `last_usage_includes_reasoning === false`.
+      const outputIncludesReasoning = usedLastFallback ? info.last_usage_includes_reasoning !== false : true;
+      const norm = normalizeDisjointUsage(stepUsage, { outputIncludesReasoning });
       if (!norm) return;
 
       const inlineModel = cleanModel(info.model || payload.model);
       if (inlineModel) noteResolvedModel(inlineModel);
+      const tierPick = pickTierWithPresence(payload, info);
+      if (tierPick.present) {
+        applyRawServiceTier(tierPick.value, { allowNullReset: true });
+      }
       const model = inlineModel || lastModel || 'unknown';
 
       deltaSeq += 1;
-      lastTcEmitted = { ts, ...norm };
+      const evId = `${eventKeyPrefix}tc:${deltaSeq}`;
+      lastTcEmitted = { ts, e: evId, ...norm };
       const ev = {
         a: 'codex',
         c: sessionId,
-        e: `${eventKeyPrefix}tc:${deltaSeq}`,
+        e: evId,
         ts,
         m: model,
         k: 'T',
@@ -666,6 +783,7 @@ export const codexAdapter = {
         out: norm.out,
         r: norm.r,
       };
+      if (serviceTier) ev.st = serviceTier;
       events.push(ev);
       if (model === 'unknown') {
         inBatchPendingUnknown.push(ev);
@@ -680,38 +798,47 @@ export const codexAdapter = {
     if (!delta) return null;
     if (delta.unchanged) return { unchanged: true };
 
-    const remainingPending = [...persistedPendingUnknown, ...inBatchPendingUnknown].slice(0, MAX_PENDING_UNKNOWN);
+    const isCompressed = String(filePath).toLowerCase().endsWith('.zst');
+    const remainingPending = isCompressed
+      ? []
+      : [...persistedPendingUnknown, ...inBatchPendingUnknown].slice(0, MAX_PENDING_UNKNOWN);
+
+    const baseCursor = {
+      agent: 'codex',
+      app: 'codex',
+      parserVersion: CODEX_PARSER_VERSION,
+      sessionId,
+      fileThreadId,
+      rolloutId,
+      parentSessionId,
+      sessionMetaSeen,
+      size: delta.stat.size,
+      mtimeMs: delta.stat.mtimeMs,
+      ino: delta.stat.ino,
+      offset: delta.newOffset,
+      firstModel,
+      lastModel,
+      serviceTier,
+      title,
+      firstTs,
+      lastTs,
+      deltaSeq,
+      hasUsageRecords,
+    };
+
+    if (!isCompressed) {
+      baseCursor.prevTotals = prevTotals;
+      baseCursor.seenTotals = seenTotals;
+      baseCursor.prevLastSig = prevLastSig;
+      baseCursor.lastTcEmitted = lastTcEmitted;
+      baseCursor.recentUr = recentUr;
+      baseCursor.pendingUnknownEvents = remainingPending;
+    }
 
     return {
       unchanged: false,
       events,
-      cursor: {
-        agent: 'codex',
-        app: 'codex',
-        parserVersion: CODEX_PARSER_VERSION,
-        sessionId,
-        fileThreadId,
-        rolloutId,
-        parentSessionId,
-        sessionMetaSeen,
-        size: delta.stat.size,
-        mtimeMs: delta.stat.mtimeMs,
-        ino: delta.stat.ino,
-        offset: delta.newOffset,
-        firstModel,
-        lastModel,
-        title,
-        firstTs,
-        lastTs,
-        prevTotals,
-        seenTotals,
-        prevLastSig,
-        lastTcEmitted,
-        recentUr,
-        pendingUnknownEvents: remainingPending,
-        deltaSeq,
-        hasUsageRecords,
-      },
+      cursor: baseCursor,
     };
   },
 };

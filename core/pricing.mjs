@@ -52,8 +52,8 @@ export function loadPrefs(dataDir = getDataDir()) {
 export function prefsMtime(dataDir = getDataDir()) {
   const pStat = safeStat(getPrefsPath(dataDir));
   const oStat = safeStat(getPricingOverridePath(dataDir));
-  const pKey = pStat ? `${pStat.mtimeMs}:${pStat.size}` : 'default';
-  const oKey = oStat ? `${oStat.mtimeMs}:${oStat.size}` : 'none';
+  const pKey = pStat ? `${pStat.mtimeMs}:${pStat.size}:${pStat.ino}` : 'default';
+  const oKey = oStat ? `${oStat.mtimeMs}:${oStat.size}:${oStat.ino}` : 'none';
   return `${pKey}|ov=${oKey}`;
 }
 
@@ -82,27 +82,44 @@ export function loadPricingOverrides(dataDir = getDataDir()) {
 }
 
 const ROUTING_PREFIX_RE = /^(?:(?:us|eu|global)\.)?(?:anthropic|openai|google|vertex|bedrock|openrouter)[/:.]/i;
+const MAX_PRICING_CACHE_ENTRIES = 4096;
+const normalizeModelCache = new Map();
+const canonicalKeyCache = new Map();
+const officialRuleCache = new Map();
 
 export function normalizeModel(raw) {
   if (!raw || typeof raw !== 'string') return 'unknown';
+  const cached = normalizeModelCache.get(raw);
+  if (cached !== undefined) return cached;
   let s = raw.trim();
   if (!s) return 'unknown';
   while (ROUTING_PREFIX_RE.test(s)) {
     s = s.replace(ROUTING_PREFIX_RE, '');
   }
-  if (/^[a-z0-9._:/-]+$/.test(s)) return s;
-  return (
-    s
-      .toLowerCase()
-      .replace(/[()[\]]+/g, ' ')
-      .replace(/[^a-z0-9._-]+/g, '-')
-      .replace(/-+/g, '-')
-      .replace(/^-|-$/g, '') || 'unknown'
-  );
+  const result = /^[a-z0-9._:/-]+$/.test(s)
+    ? s
+    : s
+        .toLowerCase()
+        .replace(/[()[\]]+/g, ' ')
+        .replace(/[^a-z0-9._-]+/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-|-$/g, '') || 'unknown';
+  if (normalizeModelCache.size >= MAX_PRICING_CACHE_ENTRIES) {
+    normalizeModelCache.clear();
+  }
+  normalizeModelCache.set(raw, result);
+  return result;
 }
 
 function canonicalMatchKey(slug) {
-  return normalizeModel(slug).replace(/(\d)\.(\d)/g, '$1-$2');
+  const cached = canonicalKeyCache.get(slug);
+  if (cached !== undefined) return cached;
+  const result = normalizeModel(slug).replace(/(\d)\.(\d)/g, '$1-$2');
+  if (canonicalKeyCache.size >= MAX_PRICING_CACHE_ENTRIES) {
+    canonicalKeyCache.clear();
+  }
+  canonicalKeyCache.set(slug, result);
+  return result;
 }
 
 const ALLOWED_SUFFIX_TOKENS = new Set([
@@ -114,6 +131,7 @@ const ALLOWED_SUFFIX_TOKENS = new Set([
   'max',
   'thinking',
   'extended',
+  'tiered',
   'latest',
   'preview',
   'exp',
@@ -218,19 +236,61 @@ function applyMultiplier(rate, mult, noteSuffix) {
   };
 }
 
+const COMPILED_OFFICIAL_RULES = OFFICIAL_PRICING_RULES.map((rule) => ({
+  rule,
+  pfx: canonicalMatchKey(rule.prefix),
+}));
+
+function matchOfficialRule(key) {
+  if (officialRuleCache.has(key)) return officialRuleCache.get(key);
+  let best = null;
+  for (let i = 0; i < COMPILED_OFFICIAL_RULES.length; i++) {
+    const entry = COMPILED_OFFICIAL_RULES[i];
+    if (officialRuleMatches(key, entry.pfx)) {
+      if (!best || entry.pfx.length > best.pfx.length) {
+        best = entry;
+      }
+    }
+  }
+  const matched = best ? best.rule : null;
+  if (officialRuleCache.size >= MAX_PRICING_CACHE_ENTRIES) {
+    officialRuleCache.clear();
+  }
+  officialRuleCache.set(key, matched);
+  return matched;
+}
+
+export function normalizeServiceTier(raw) {
+  if (typeof raw !== 'string') return '';
+  const k = raw.trim().toLowerCase();
+  if (k === 'fast' || k === 'priority') return 'fast';
+  if (k === 'flex') return 'flex';
+  return '';
+}
+
+export function normalizeInferenceGeo(raw) {
+  if (typeof raw !== 'string') return '';
+  return raw.trim().toLowerCase() === 'us' ? 'us' : '';
+}
+
 export function resolveModelRate(
   model,
-  { ts = Date.now(), promptTotal = 0, agent = '', overrides = null } = {},
+  { ts = Date.now(), promptTotal = 0, agent = '', serviceTier = '', inferenceGeo = '', overrides = null } = {},
 ) {
   const key = canonicalMatchKey(model);
   const multRaw = agent && overrides?.multipliers ? Number(overrides.multipliers[agent]) : 1;
   const mult = Number.isFinite(multRaw) && multRaw > 0 ? multRaw : 1;
   const multLabel = mult !== 1 ? `×${mult}` : '';
+  const normTier = normalizeServiceTier(serviceTier);
+  const normGeo = normalizeInferenceGeo(inferenceGeo);
 
   // 1. User custom model overrides (longest prefix match)
-  if (overrides?.models && typeof overrides.models === 'object') {
+  const customModels = overrides?.models && typeof overrides.models === 'object' ? overrides.models : null;
+  if (customModels) {
     let bestCustom = null;
-    for (const [rawPrefix, cfg] of Object.entries(overrides.models)) {
+    for (const rawPrefix in customModels) {
+      if (!Object.prototype.hasOwnProperty.call(customModels, rawPrefix)) continue;
+      const cfg = customModels[rawPrefix];
       if (!cfg || typeof cfg !== 'object') continue;
       const pfx = canonicalMatchKey(rawPrefix);
       if (customPrefixMatches(key, pfx)) {
@@ -263,21 +323,28 @@ export function resolveModelRate(
     }
   }
 
-  // 2. Built-in official pricing catalog (strict suffix guard, longest prefix wins)
-  let best = null;
-  for (const rule of OFFICIAL_PRICING_RULES) {
-    const pfx = canonicalMatchKey(rule.prefix);
-    if (officialRuleMatches(key, pfx)) {
-      if (!best || pfx.length > best.pfx.length) {
-        best = { pfx, rule };
-      }
+  // 2. Built-in official pricing catalog (strict suffix guard, longest prefix wins, memoized by slug)
+  const bestRule = matchOfficialRule(key);
+  if (bestRule) {
+    const resolved = bestRule.resolve({ ts, promptTotal });
+    let tierMult = 1;
+    const noteParts = [];
+    if (normTier === 'fast' && (bestRule.provider === 'openai' || bestRule.provider === 'anthropic')) {
+      tierMult *= 2;
+      noteParts.push('fast 2x');
+    } else if (normTier === 'flex' && bestRule.provider === 'openai') {
+      tierMult *= 0.5;
+      noteParts.push('flex 0.5x');
     }
-  }
-  if (best) {
-    const resolved = best.rule.resolve({ ts, promptTotal });
+    if (normGeo === 'us' && bestRule.provider === 'anthropic') {
+      tierMult *= 1.1;
+      noteParts.push('US residency 1.1x');
+    }
+    if (multLabel) noteParts.push(multLabel);
+    const totalMult = tierMult * mult;
     return applyMultiplier(
       {
-        provider: best.rule.provider,
+        provider: bestRule.provider,
         input: resolved.input,
         cacheRead: resolved.cacheRead,
         cacheWrite5m: resolved.cacheWrite5m ?? resolved.input,
@@ -285,10 +352,10 @@ export function resolveModelRate(
         output: resolved.output,
         tierNote: resolved.tierNote,
         matchType: 'official',
-        matchedRule: best.rule.prefix,
+        matchedRule: bestRule.prefix,
       },
-      mult,
-      multLabel,
+      totalMult,
+      noteParts.join(', '),
     );
   }
 

@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
 import { appendFileSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import test from 'node:test';
 import * as zlib from 'node:zlib';
+import { antigravityAdapter } from '../adapters/antigravity.mjs';
+import { claudeCodeAdapter } from '../adapters/claude-code.mjs';
+import { detectAdapterForPath } from '../adapters/index.mjs';
 import { canonicalFileKey } from '../core/fs-utils.mjs';
 import { buildReport } from '../core/report.mjs';
 import { syncAllSources, syncSingleSource } from '../core/sync.mjs';
@@ -1783,5 +1787,712 @@ test('Codex v2.0.3 regressions: same-thread deleted sibling archive preservation
     }
   } finally {
     h1.cleanup();
+  }
+});
+
+test('v2.0.4 regressions: Antigravity MODEL_CHANGE_RE sentence boundary & auto-upgrade, plus slim .zst cursors', () => {
+  const h = createTestEnv('atm-v204-');
+  try {
+    // 1. Antigravity notice followed by prose containing "to ..." must NOT cross sentence periods
+    const agConv = 'ag-v204-sentence-guard';
+    const agFile = h.mkAgTranscript(agConv);
+    writeFileSync(
+      agFile,
+      [
+        JSON.stringify({
+          step_index: 0,
+          type: 'USER_INPUT',
+          created_at: '2026-11-23T10:00:00Z',
+          content:
+            'The user has changed `Model Selection` from Gemini 3.1 Pro (High) to `Claude Opus 4.6 (Thinking)`. ' +
+            "Do not feel compelled to comment on this change if the user doesn't ask about it.",
+        }),
+        JSON.stringify({
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-23T10:00:05Z',
+          input_tokens: 1000,
+          cache_read_tokens: 500,
+          output_tokens: 200,
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+
+    // Seed a legacy v2.0.3 Antigravity cursor (lacking parserVersion) with a corrupted model event
+    const evDir = join(h.dataDir, 'events');
+    mkdirSync(evDir, { recursive: true });
+    writeFileSync(
+      join(evDir, '2026-11.jsonl'),
+      JSON.stringify({
+        a: 'antigravity',
+        c: agConv,
+        e: '1',
+        ts: Date.parse('2026-11-23T10:00:05Z'),
+        m: 'comment-on-this-change-if-the-user-doesn-t-ask-about-it',
+        k: 'P',
+        in: 1000,
+        cr: 500,
+        cw5: 0,
+        cw1h: 0,
+        out: 200,
+        r: 0,
+      }) + '\n',
+      'utf-8',
+    );
+    const agStat = statSync(agFile);
+    writeFileSync(
+      join(h.dataDir, 'cursors.json'),
+      JSON.stringify({
+        version: 2,
+        files: {
+          [agFile]: {
+            agent: 'antigravity',
+            app: 'antigravity',
+            sessionId: agConv,
+            size: agStat.size,
+            mtimeMs: agStat.mtimeMs,
+            ino: agStat.ino,
+            offset: agStat.size,
+            lastModel: 'comment-on-this-change-if-the-user-doesn-t-ask-about-it',
+            firstTs: Date.parse('2026-11-23T10:00:00Z'),
+            lastTs: Date.parse('2026-11-23T10:00:05Z'),
+          },
+        },
+        sessions: {
+          [`antigravity:${agConv}`]: {
+            agent: 'antigravity',
+            sessionId: agConv,
+            app: 'antigravity',
+            lastModel: 'comment-on-this-change-if-the-user-doesn-t-ask-about-it',
+          },
+        },
+      }),
+      'utf-8',
+    );
+
+    // 2. Also create a compressed Codex .jsonl.zst rollout and verify its persisted cursor omits resume buffers
+    const zstId = '55555555-5555-5555-5555-555555555555';
+    const zstFile = h.mkCodexRollout('2026/11/23', `rollout-2026-11-23T10-00-00-${zstId}.jsonl.zst`);
+    const zstRaw =
+      [
+        JSON.stringify({ timestamp: '2026-11-23T10:00:00Z', type: 'session_meta', payload: { id: zstId } }),
+        JSON.stringify({ timestamp: '2026-11-23T10:00:01Z', type: 'turn_context', payload: { model: 'gpt-6.2-sol' } }),
+        JSON.stringify({
+          timestamp: '2026-11-23T10:00:02Z',
+          type: 'event_msg',
+          payload: {
+            type: 'token_usage_record',
+            model: 'gpt-6.2-sol',
+            response_id: 'r1',
+            usage: { input_tokens: 1000, cached_input_tokens: 800, output_tokens: 100 },
+          },
+        }),
+      ].join('\n') + '\n';
+    writeFileSync(zstFile, zlib.zstdCompressSync(Buffer.from(zstRaw, 'utf-8')));
+
+    // Incremental sync should auto-upgrade the legacy Antigravity cursor and slim the .zst cursor
+    const res = syncAllSources({ dataDir: h.dataDir });
+    assert.equal(res.skipped, 0);
+
+    const repAg = buildReport({ dataDir: h.dataDir, rangeDays: 0, agent: 'antigravity', timeZone: 'UTC' });
+    assert.equal(repAg.period.steps, 1);
+    assert.equal(repAg.period.unpricedSteps, 0);
+    assert.equal(repAg.models[0].model, 'claude-opus-4.6-thinking');
+
+    const rawCursorsText = readFileSync(join(h.dataDir, 'cursors.json'), 'utf-8');
+    // Compact single-line JSON (no 2-space pretty indentation)
+    assert.equal(rawCursorsText.trim().includes('\n'), false);
+    const cursors = JSON.parse(rawCursorsText);
+    const zstEntry = Object.entries(cursors.files).find(([k]) => k.endsWith('.jsonl.zst'))?.[1];
+    assert.ok(zstEntry, 'expected .jsonl.zst cursor entry');
+    assert.equal(zstEntry.seenTotals, undefined);
+    assert.equal(zstEntry.recentUr, undefined);
+    assert.equal(zstEntry.prevTotals, undefined);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('v2.1.0 regressions: Claude depth-5 workflows/iterations/thinking/fast, Codex priority/flex tiers, Antigravity ReDoS & non-DONE/firstModel, and legacy v1 AG import', () => {
+  const h = createTestEnv('atm-v210-');
+  const prevLegacyEnv = process.env.TOKEN_METER_LEGACY_AG_DIR;
+  try {
+    // 1. Claude Code depth-5 workflow subagent (`<project>/<session>/subagents/workflows/wf_1/agent-x.jsonl`)
+    //    plus `usage.iterations[]` (multi-step compaction), `output_tokens_details.thinking_tokens`, `speed: fast`, `claude-fable-5-2`
+    const wfDir = join(h.claudeProjectsDir, 'proj-wf', 'parent-sess-1', 'subagents', 'workflows', 'wf_abc-1');
+    mkdirSync(wfDir, { recursive: true });
+    const wfFile = join(wfDir, 'agent-worker-1.jsonl');
+    writeFileSync(
+      wfFile,
+      [
+        JSON.stringify({
+          type: 'user',
+          timestamp: '2026-11-23T10:00:00Z',
+          sessionId: 'parent-sess-1',
+          message: { role: 'user', content: 'Analyze workflow step' },
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          timestamp: '2026-11-23T10:00:05Z',
+          sessionId: 'parent-sess-1',
+          requestId: 'req_wf_1',
+          message: {
+            id: 'msg_wf_1',
+            model: 'claude-fable-5-2',
+            usage: {
+              // Top-level shows executor turn only; iterations[] includes compaction + executor
+              input_tokens: 1_000,
+              cache_read_input_tokens: 10_000,
+              cache_creation_input_tokens: 2_000,
+              cache_creation: { ephemeral_5m_input_tokens: 2_000, ephemeral_1h_input_tokens: 0 },
+              output_tokens: 500,
+              output_tokens_details: { thinking_tokens: 300 },
+              speed: 'fast',
+              iterations: [
+                {
+                  type: 'compaction',
+                  input_tokens: 4_000,
+                  cache_read_input_tokens: 20_000,
+                  cache_creation_input_tokens: 0,
+                  output_tokens: 1_500,
+                },
+                {
+                  type: 'message',
+                  input_tokens: 1_000,
+                  cache_read_input_tokens: 10_000,
+                  cache_creation_input_tokens: 2_000,
+                  cache_creation: { ephemeral_5m_input_tokens: 2_000, ephemeral_1h_input_tokens: 0 },
+                  output_tokens: 500,
+                },
+              ],
+            },
+          },
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+
+    // 2. Codex thread_settings_applied priority (2x) -> default (1x) -> flex (0.5x)
+    const cxId = '77777777-7777-7777-7777-777777777777';
+    const cxFile = h.mkCodexRollout('2026/11/23', `rollout-2026-11-23T11-00-00-${cxId}.jsonl`);
+    writeFileSync(
+      cxFile,
+      [
+        JSON.stringify({ timestamp: '2026-11-23T11:00:00Z', type: 'session_meta', payload: { id: cxId } }),
+        JSON.stringify({ timestamp: '2026-11-23T11:00:01Z', type: 'turn_context', payload: { model: 'gpt-6.2-sol' } }),
+        JSON.stringify({
+          timestamp: '2026-11-23T11:00:02Z',
+          type: 'event_msg',
+          payload: { type: 'thread_settings_applied', thread_settings: { service_tier: 'priority' } },
+        }),
+        JSON.stringify({
+          timestamp: '2026-11-23T11:00:03Z',
+          type: 'token_usage_record',
+          payload: {
+            response_id: 'r_p1',
+            usage: { input_tokens: 1_000_000, cached_input_tokens: 0, output_tokens: 0 },
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-11-23T11:00:04Z',
+          type: 'event_msg',
+          payload: { type: 'thread_settings_applied', thread_settings: { service_tier: 'flex' } },
+        }),
+        JSON.stringify({
+          timestamp: '2026-11-23T11:00:05Z',
+          type: 'token_usage_record',
+          payload: {
+            response_id: 'r_f1',
+            usage: { input_tokens: 100_000, cached_input_tokens: 0, output_tokens: 0 },
+          },
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+
+    // 3. Antigravity: 100KB adversarial MODEL_CHANGE_RE input (must finish in <200ms, no ReDoS),
+    //    plus ERROR terminal status with tokens, plus earlier unknown step backfilled by later firstModel
+    const agId = 'ag-v210-redos-and-backfill';
+    const agFile = h.mkAgTranscript(agId);
+    writeFileSync(
+      agFile,
+      [
+        JSON.stringify({
+          step_index: 0,
+          type: 'USER_INPUT',
+          created_at: '2026-11-23T12:00:00Z',
+          content: 'User changed `Model Selection` from ' + 'a to '.repeat(20_000) + 'end_without_dot',
+        }),
+        JSON.stringify({
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'ERROR',
+          created_at: '2026-11-23T12:00:01Z',
+          input_tokens: 10_000,
+          cache_read_tokens: 0,
+          output_tokens: 1_000,
+        }),
+        JSON.stringify({
+          step_index: 2,
+          type: 'PLANNER_RESPONSE',
+          status: 'IN_PROGRESS',
+          created_at: '2026-11-23T12:00:02Z',
+          input_tokens: 999_999,
+          cache_read_tokens: 0,
+          output_tokens: 999,
+        }),
+        JSON.stringify({
+          step_index: 3,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-23T12:00:03Z',
+          model: 'gemini-4-neon-high',
+          input_tokens: 20_000,
+          cache_read_tokens: 0,
+          output_tokens: 2_000,
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+
+    const tRedos0 = performance.now();
+    const agScan = antigravityAdapter.scanDelta(agFile, null, { sessionId: agId, app: 'antigravity' }, true);
+    const tRedosMs = performance.now() - tRedos0;
+    assert.ok(tRedosMs < 200, `MODEL_CHANGE_RE should be linear/bounded (<200ms), got ${tRedosMs.toFixed(1)}ms`);
+    // Step 1 (ERROR) kept and backfilled to gemini-4-neon-high; Step 2 (IN_PROGRESS) skipped; Step 3 kept
+    assert.equal(agScan.events.length, 2);
+    assert.equal(agScan.events[0].m, 'gemini-4-neon-high');
+    assert.equal(agScan.events[1].m, 'gemini-4-neon-high');
+
+    // 4. Legacy v1 ~/.gemini/token-meter ledger with one archived deleted session + one overlapping live event
+    const legacyDir = join(h.root, 'legacy-v1-tm');
+    mkdirSync(join(legacyDir, 'events'), { recursive: true });
+    writeFileSync(
+      join(legacyDir, 'events', '2026-11.jsonl'),
+      [
+        // Deleted archived session (must be imported)
+        JSON.stringify({
+          c: 'ag-deleted-v1-sess',
+          i: 5,
+          ts: Date.parse('2026-11-18T10:00:00Z'),
+          m: 'gemini-4-carbon-high',
+          k: 'P',
+          in: 50_000,
+          cr: 100_000,
+          out: 5_000,
+        }),
+        // Overlapping live event with stale wrong model (must NOT overwrite live v3 event!)
+        JSON.stringify({
+          c: agId,
+          i: 3,
+          ts: Date.parse('2026-11-23T12:00:03Z'),
+          m: 'stale-v1-wrong-model',
+          k: 'P',
+          in: 20_000,
+          cr: 0,
+          out: 2_000,
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+    writeFileSync(
+      join(legacyDir, 'cursors.json'),
+      JSON.stringify({
+        version: 1,
+        files: {},
+        sessions: {
+          'ag-deleted-v1-sess': {
+            convId: 'ag-deleted-v1-sess',
+            app: 'antigravity',
+            title: 'Archived Legacy Conversation',
+            lastModel: 'gemini-4-carbon-high',
+            firstTs: Date.parse('2026-11-18T10:00:00Z'),
+            lastTs: Date.parse('2026-11-18T10:00:00Z'),
+          },
+        },
+      }),
+      'utf-8',
+    );
+    process.env.TOKEN_METER_LEGACY_AG_DIR = legacyDir;
+
+    const syncRes = syncAllSources({ dataDir: h.dataDir });
+    assert.equal(syncRes.legacyImported, 1);
+
+    // Second sync must NOT re-import legacy events
+    const syncRes2 = syncAllSources({ dataDir: h.dataDir });
+    assert.equal(syncRes2.legacyImported, 0);
+
+    // Verify Claude Code depth-5 workflow subagent + iterations + thinking + fast 2x cost
+    const repCc = buildReport({ dataDir: h.dataDir, rangeDays: 0, agent: 'claude-code', timeZone: 'UTC' });
+    assert.equal(repCc.period.steps, 1);
+    assert.equal(repCc.period.unpricedSteps, 0);
+    assert.equal(repCc.period.input, 5_000);
+    assert.equal(repCc.period.cacheRead, 30_000);
+    assert.equal(repCc.period.cacheWrite5m, 2_000);
+    assert.equal(repCc.period.output, 2_000);
+    assert.equal(repCc.period.reasoning, 300);
+    assert.equal(repCc.sessions[0].sessionId, 'parent-sess-1:workflows/wf_abc-1/agent-worker-1');
+    // Fast 2x Fable 5.2: in=$16/M, cr=$0.40/M, cw5=$20/M, out=$80/M
+    // 0.005*16 + 0.03*0.4 + 0.002*20 + 0.002*80 = 0.08 + 0.012 + 0.04 + 0.16 = $0.292
+    assert.equal(Number(repCc.period.costUsd.toFixed(6)), 0.292);
+    assert.equal(repCc.models[0].fastSteps, 1);
+
+    // Verify Codex priority (2x) + >272K (2x) + flex (0.5x)
+    const repCx = buildReport({ dataDir: h.dataDir, rangeDays: 0, agent: 'codex', timeZone: 'UTC' });
+    assert.equal(repCx.period.steps, 2);
+    // Step 1: 1M input (>272K -> $4/M base) * priority 2x = $8.00
+    // Step 2: 100K input (<=272K -> $2/M base) * flex 0.5x = $0.10
+    // Total = $8.10
+    assert.equal(Number(repCx.period.costUsd.toFixed(6)), 8.1);
+    assert.equal(repCx.models[0].fastSteps, 1);
+    assert.equal(repCx.models[0].flexSteps, 1);
+
+    // Verify Antigravity includes both live v3 steps (no stale overwrite) and archived v1 session
+    const repAg = buildReport({ dataDir: h.dataDir, rangeDays: 0, agent: 'antigravity', timeZone: 'UTC' });
+    assert.equal(repAg.period.steps, 3);
+    assert.equal(repAg.period.unpricedSteps, 0);
+    const archivedSess = repAg.sessions.find((s) => s.sessionId === 'ag-deleted-v1-sess');
+    assert.ok(archivedSess, 'expected archived v1 session to be imported');
+    assert.equal(archivedSess.title, 'Archived Legacy Conversation');
+    const liveSess = repAg.sessions.find((s) => s.sessionId === agId);
+    assert.equal(liveSess.primaryModel, 'gemini-4-neon-high');
+  } finally {
+    if (prevLegacyEnv === undefined) delete process.env.TOKEN_METER_LEGACY_AG_DIR;
+    else process.env.TOKEN_METER_LEGACY_AG_DIR = prevLegacyEnv;
+    h.cleanup();
+  }
+});
+
+test('v2.1.0 red-team round-2 regressions: Claude subagents path scoping, Codex service_tier reset/handoff, Claude single-element iterations/cw1h/oversized-sessionId, and whitespace model guards', () => {
+  const h = createTestEnv('atm-v210-rt2-');
+  const prevClaudeRoots = process.env.TOKEN_METER_CLAUDE_ROOTS;
+  try {
+    // 1. P1-1: Ancestor dir named `subagents` and project dir named `subagents` MUST NOT misclassify top-level sessions,
+    //    real subagents under project `subagents` MUST still work, and Codex rollouts under `subagents/` MUST route to codex.
+    const ancProjects = join(h.root, 'subagents', '.claude', 'projects');
+    const ancSessDir = join(ancProjects, 'proj-alpha');
+    mkdirSync(ancSessDir, { recursive: true });
+    const ancFile = join(ancSessDir, 'sess-ancestor.jsonl');
+    writeFileSync(
+      ancFile,
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-11-23T09:00:00Z',
+        sessionId: 'sess-ancestor',
+        requestId: 'req_anc_1',
+        message: {
+          id: 'msg_anc_1',
+          model: 'claude-opus-5',
+          usage: { input_tokens: 1_000, output_tokens: 100 },
+        },
+      }) + '\n',
+      'utf-8',
+    );
+
+    const projSubDir = join(h.claudeProjectsDir, 'subagents');
+    mkdirSync(projSubDir, { recursive: true });
+    const projTopFile = join(projSubDir, 'sess-proj-sub.jsonl');
+    writeFileSync(
+      projTopFile,
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-11-23T09:05:00Z',
+        sessionId: 'sess-proj-sub',
+        requestId: 'req_ps_1',
+        message: {
+          id: 'msg_ps_1',
+          model: 'claude-opus-5',
+          usage: { input_tokens: 2_000, output_tokens: 200 },
+        },
+      }) + '\n',
+      'utf-8',
+    );
+
+    const realSubDir = join(projSubDir, 'parent-99', 'subagents', 'workflows', 'wf_2');
+    mkdirSync(realSubDir, { recursive: true });
+    const realSubFile = join(realSubDir, 'agent-9.jsonl');
+    writeFileSync(
+      realSubFile,
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-11-23T09:06:00Z',
+        sessionId: 'parent-99',
+        requestId: 'req_rs_1',
+        message: {
+          id: 'msg_rs_1',
+          model: 'claude-opus-5',
+          usage: { input_tokens: 3_000, output_tokens: 300 },
+        },
+      }) + '\n',
+      'utf-8',
+    );
+
+    process.env.TOKEN_METER_CLAUDE_ROOTS = [h.claudeProjectsDir, ancProjects].join(process.platform === 'win32' ? ';' : ':');
+    const ancMeta = claudeCodeAdapter.inferMeta(ancFile);
+    assert.equal(ancMeta.isSubagent, false);
+    assert.equal(ancMeta.parentSessionId, '');
+    assert.equal(ancMeta.sessionId, 'sess-ancestor');
+
+    const projMeta = claudeCodeAdapter.inferMeta(projTopFile);
+    assert.equal(projMeta.isSubagent, false);
+    assert.equal(projMeta.parentSessionId, '');
+    assert.equal(projMeta.sessionId, 'sess-proj-sub');
+
+    const realSubMeta = claudeCodeAdapter.inferMeta(realSubFile);
+    assert.equal(realSubMeta.isSubagent, true);
+    assert.equal(realSubMeta.parentSessionId, 'parent-99');
+    assert.equal(realSubMeta.sessionId, 'parent-99:workflows/wf_2/agent-9');
+
+    const codexUnderSub = join(h.root, 'subagents', 'rollout-2026-11-23T10-00-00-11111111-1111-1111-1111-111111111111.jsonl');
+    assert.equal(detectAdapterForPath(codexUnderSub)?.id, 'codex');
+    assert.equal(detectAdapterForPath(`${codexUnderSub}.zst`)?.id, 'codex');
+
+    // 2. P1-2: Codex service_tier null/'auto' resets + tc->ur handoff service_tier propagation
+    const resetId = 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1';
+    const resetFile = h.mkCodexRollout('2026/11/23', `rollout-2026-11-23T10-00-00-${resetId}.jsonl`);
+    writeFileSync(
+      resetFile,
+      [
+        JSON.stringify({ timestamp: '2026-11-23T10:00:00Z', type: 'session_meta', payload: { id: resetId } }),
+        JSON.stringify({ timestamp: '2026-11-23T10:00:01Z', type: 'turn_context', payload: { model: 'gpt-6.2-sol' } }),
+        // Fast (2x)
+        JSON.stringify({ timestamp: '2026-11-23T10:00:02Z', type: 'event_msg', payload: { type: 'thread_settings_applied', thread_settings: { service_tier: 'priority' } } }),
+        JSON.stringify({ timestamp: '2026-11-23T10:00:03Z', type: 'token_usage_record', payload: { response_id: 'r1', usage: { input_tokens: 100_000, output_tokens: 0 } } }),
+        // Reset via explicit null -> standard (1x)
+        JSON.stringify({ timestamp: '2026-11-23T10:00:04Z', type: 'event_msg', payload: { type: 'thread_settings_applied', thread_settings: { service_tier: null } } }),
+        JSON.stringify({ timestamp: '2026-11-23T10:00:05Z', type: 'token_usage_record', payload: { response_id: 'r2', usage: { input_tokens: 100_000, output_tokens: 0 } } }),
+        // Fast again via turn_context
+        JSON.stringify({ timestamp: '2026-11-23T10:00:06Z', type: 'turn_context', payload: { model: 'gpt-6.2-sol', service_tier: 'priority' } }),
+        JSON.stringify({ timestamp: '2026-11-23T10:00:07Z', type: 'token_usage_record', payload: { response_id: 'r3', usage: { input_tokens: 100_000, output_tokens: 0 } } }),
+        // Reset via 'auto' -> standard (1x)
+        JSON.stringify({ timestamp: '2026-11-23T10:00:08Z', type: 'turn_context', payload: { model: 'gpt-6.2-sol', service_tier: 'auto' } }),
+        JSON.stringify({ timestamp: '2026-11-23T10:00:09Z', type: 'token_usage_record', payload: { response_id: 'r4', usage: { input_tokens: 100_000, output_tokens: 0 } } }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+
+    const handoffId = 'a2a2a2a2-a2a2-a2a2-a2a2-a2a2a2a2a2a2';
+    const handoffFile = h.mkCodexRollout('2026/11/23', `rollout-2026-11-23T10-10-00-${handoffId}.jsonl`);
+    writeFileSync(
+      handoffFile,
+      [
+        JSON.stringify({ timestamp: '2026-11-23T10:10:00.000Z', type: 'session_meta', payload: { id: handoffId } }),
+        JSON.stringify({ timestamp: '2026-11-23T10:10:01.000Z', type: 'turn_context', payload: { model: 'gpt-6.2-sol' } }),
+        // Step A arrives as token_count without service_tier, then paired token_usage_record 5ms later carries service_tier: 'priority'
+        JSON.stringify({ timestamp: '2026-11-23T10:10:02.100Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 100_000, output_tokens: 0 } } } }),
+        JSON.stringify({ timestamp: '2026-11-23T10:10:02.105Z', type: 'event_msg', payload: { type: 'token_usage_record', response_id: 'rh1', service_tier: 'priority', usage: { input_tokens: 100_000, output_tokens: 0 } } }),
+        // Step B omits service_tier and MUST inherit 'fast' from the handoff
+        JSON.stringify({ timestamp: '2026-11-23T10:10:05.000Z', type: 'event_msg', payload: { type: 'token_usage_record', response_id: 'rh2', usage: { input_tokens: 100_000, output_tokens: 0 } } }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+
+    // 3. P1-3 + P2-2 + P2-3b: Claude single-element iterations, top-level cw1h preserved, iteration thinking_tokens,
+    //    >16KB leading file-history-snapshot carrying sessionId, and whitespace-only model guard (CC + AG)
+    const iterFile = join(h.claudeProjectsDir, 'proj-iter', 'custom-log-name.jsonl');
+    mkdirSync(join(h.claudeProjectsDir, 'proj-iter'), { recursive: true });
+    writeFileSync(
+      iterFile,
+      [
+        JSON.stringify({
+          type: 'file-history-snapshot',
+          sessionId: 'sess-from-big-snapshot',
+          snapshot: { blob: 'x'.repeat(20_000) },
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          timestamp: '2026-11-23T11:00:00Z',
+          requestId: 'req_it_1',
+          message: {
+            id: 'msg_it_1',
+            model: 'claude-opus-5',
+            usage: {
+              input_tokens: 0,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 5_000,
+              cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 5_000 },
+              output_tokens: 0,
+              iterations: [
+                {
+                  type: 'compaction',
+                  input_tokens: 2_000,
+                  cache_read_input_tokens: 10_000,
+                  cache_creation_input_tokens: 5_000,
+                  output_tokens: 400,
+                  output_tokens_details: { thinking_tokens: 150 },
+                },
+              ],
+            },
+          },
+        }),
+        JSON.stringify({
+          type: 'assistant',
+          timestamp: '2026-11-23T11:00:05Z',
+          requestId: 'req_it_2',
+          message: {
+            id: 'msg_it_2',
+            model: '   ',
+            usage: { input_tokens: 1_000, output_tokens: 100 },
+          },
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+
+    const agWsId = 'ag-ws-model-guard';
+    const agWsFile = h.mkAgTranscript(agWsId);
+    writeFileSync(
+      agWsFile,
+      [
+        JSON.stringify({
+          step_index: 1,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-23T12:00:00Z',
+          model: 'gemini-4-neon-high',
+          input_tokens: 5_000,
+          output_tokens: 500,
+        }),
+        JSON.stringify({
+          step_index: 2,
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-23T12:00:05Z',
+          model: '   ',
+          input_tokens: 2_000,
+          output_tokens: 200,
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+
+    const syncRes = syncAllSources({ dataDir: h.dataDir });
+    assert.equal(syncRes.skipped, 0);
+
+    // Assert Claude Code results
+    const repCc = buildReport({ dataDir: h.dataDir, rangeDays: 0, agent: 'claude-code', timeZone: 'UTC' });
+    assert.equal(repCc.period.unpricedSteps, 0);
+    const ancSess = repCc.sessions.find((s) => s.sessionId === 'sess-ancestor');
+    assert.ok(ancSess);
+    assert.equal(ancSess.title.startsWith('[Subagent]'), false);
+    const projSess = repCc.sessions.find((s) => s.sessionId === 'sess-proj-sub');
+    assert.ok(projSess);
+    assert.equal(projSess.title.startsWith('[Subagent]'), false);
+    assert.ok(repCc.sessions.find((s) => s.sessionId === 'parent-99:workflows/wf_2/agent-9'));
+
+    const iterSess = repCc.sessions.find((s) => s.sessionId === 'sess-from-big-snapshot');
+    assert.ok(iterSess, 'sessionId should be extracted from >16KB file-history-snapshot');
+    assert.equal(iterSess.steps, 2);
+    assert.equal(iterSess.input, 3_000);
+    assert.equal(iterSess.cacheRead, 10_000);
+    assert.equal(iterSess.cacheWrite5m, 0);
+    assert.equal(iterSess.cacheWrite1h, 5_000);
+    assert.equal(iterSess.output, 500);
+    assert.equal(iterSess.reasoning, 150);
+    assert.equal(iterSess.primaryModel, 'claude-opus-5');
+    assert.equal(iterSess.unpricedSteps, 0);
+
+    // Assert Codex results
+    const repCx = buildReport({ dataDir: h.dataDir, rangeDays: 0, agent: 'codex', timeZone: 'UTC' });
+    const resetSess = repCx.sessions.find((s) => s.sessionId === resetId);
+    assert.equal(resetSess.steps, 4);
+    // 2 fast ($0.40 each) + 2 standard ($0.20 each) = $1.20
+    assert.equal(Number(resetSess.costUsd.toFixed(6)), 1.2);
+
+    const handoffSess = repCx.sessions.find((s) => s.sessionId === handoffId);
+    assert.equal(handoffSess.steps, 2);
+    // Both steps fast (2x $2/M * 0.1M = $0.40 each) = $0.80
+    assert.equal(Number(handoffSess.costUsd.toFixed(6)), 0.8);
+    assert.equal(repCx.models[0].fastSteps, 4);
+
+    // Assert Antigravity whitespace model guard
+    const repAg = buildReport({ dataDir: h.dataDir, rangeDays: 0, agent: 'antigravity', timeZone: 'UTC' });
+    const agWsSess = repAg.sessions.find((s) => s.sessionId === agWsId);
+    assert.equal(agWsSess.steps, 2);
+    assert.equal(agWsSess.unpricedSteps, 0);
+    assert.equal(agWsSess.primaryModel, 'gemini-4-neon-high');
+
+    // 4. Red-team round-3 regressions:
+    //    (a) Relative TOKEN_METER_CLAUDE_ROOTS preserves subagent parentSessionId & inferMeta(full, [root]) parity
+    const relRootAbs = join(h.root, 'cc-rel-root');
+    const relSubDir = join(relRootAbs, 'proj-a', 'parent-uuid-rel', 'subagents');
+    mkdirSync(relSubDir, { recursive: true });
+    const relSubAbs = join(relSubDir, 'agent-worker.jsonl');
+    writeFileSync(
+      relSubAbs,
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-11-23T12:30:00Z',
+        sessionId: 'parent-uuid-rel',
+        requestId: 'req_rel_1',
+        message: { id: 'msg_rel_1', model: 'claude-opus-5', usage: { input_tokens: 1_000, output_tokens: 100 } },
+      }) + '\n',
+      'utf-8',
+    );
+    const prevCwd = process.cwd();
+    try {
+      process.chdir(h.root);
+      const relRootSpec = './cc-rel-root';
+      process.env.TOKEN_METER_CLAUDE_ROOTS = relRootSpec;
+      const relDiscovered = claudeCodeAdapter.discoverSources();
+      assert.equal(relDiscovered.length, 1);
+      assert.equal(relDiscovered[0].isSubagent, true);
+      assert.equal(relDiscovered[0].parentSessionId, 'parent-uuid-rel');
+      assert.equal(relDiscovered[0].sessionId, 'parent-uuid-rel:agent-worker');
+      assert.deepEqual(
+        claudeCodeAdapter.inferMeta(relDiscovered[0].filePath, [relRootSpec]),
+        claudeCodeAdapter.inferMeta(relDiscovered[0].filePath),
+      );
+    } finally {
+      process.chdir(prevCwd);
+    }
+
+    //    (b) Codex turn_context with payload.service_tier: null + collaboration_mode.settings.service_tier: 'priority'
+    const serdeId = 'a3a3a3a3-a3a3-a3a3-a3a3-a3a3a3a3a3a3';
+    const serdeFile = h.mkCodexRollout('2026/11/23', `rollout-2026-11-23T12-40-00-${serdeId}.jsonl`);
+    writeFileSync(
+      serdeFile,
+      [
+        JSON.stringify({ timestamp: '2026-11-23T12:40:00Z', type: 'session_meta', payload: { id: serdeId } }),
+        JSON.stringify({
+          timestamp: '2026-11-23T12:40:01Z',
+          type: 'turn_context',
+          payload: {
+            model: 'gpt-6.2-sol',
+            service_tier: null,
+            collaboration_mode: { settings: { service_tier: 'priority' } },
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-11-23T12:40:02Z',
+          type: 'token_usage_record',
+          payload: { response_id: 'r_serde_1', usage: { input_tokens: 100_000, output_tokens: 0 } },
+        }),
+        // Subsequent explicit null without nested priority resets back to standard (1x)
+        JSON.stringify({
+          timestamp: '2026-11-23T12:40:03Z',
+          type: 'turn_context',
+          payload: { model: 'gpt-6.2-sol', service_tier: null },
+        }),
+        JSON.stringify({
+          timestamp: '2026-11-23T12:40:04Z',
+          type: 'token_usage_record',
+          payload: { response_id: 'r_serde_2', usage: { input_tokens: 100_000, output_tokens: 0 } },
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+    syncSingleSource(serdeFile, { agent: 'codex', dataDir: h.dataDir });
+    const repSerde = buildReport({ dataDir: h.dataDir, rangeDays: 0, agent: 'codex', timeZone: 'UTC' });
+    const serdeSess = repSerde.sessions.find((s) => s.sessionId === serdeId);
+    assert.equal(serdeSess.steps, 2);
+    // Step 1 fast ($0.40) + Step 2 standard ($0.20) = $0.60
+    assert.equal(Number(serdeSess.costUsd.toFixed(6)), 0.6);
+  } finally {
+    if (prevClaudeRoots === undefined) delete process.env.TOKEN_METER_CLAUDE_ROOTS;
+    else process.env.TOKEN_METER_CLAUDE_ROOTS = prevClaudeRoots;
+    h.cleanup();
   }
 });

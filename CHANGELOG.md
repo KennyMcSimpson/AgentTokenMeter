@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.1.0 — Sub-Second Sidecar Switching, Deep Workflow/Tier Accounting & Multi-Account Discovery
+
+### Fixed
+- **Antigravity Sidecar Switching Livelock & Large-Ledger Performance**: Eliminated the 5-second poll-vs-click cancellation livelock in `ui/app.js` (cancelling pending polls during interactive clicks, stripping `AbortSignal` before `window.sidecar.fetch` to avoid Chromium IPC `DataCloneError`, and requesting `noSync=1` on instant filter switches). Deferred initial sidecar warmup sync until after `app.run()` binds, memoized `resolveModelRate()` and hourly-validated `localDateKey()`, cached parsed ledger snapshots and LRU reports with UTC-midnight and inode-aware ETag invalidation, and compacted `cursors.json` (stripping dead resume buffers on immutable `.jsonl.zst` archives), cutting 794K-event switches from ~9–11 s to 1 ms–0.8 s.
+- **Claude Code Deep Workflow Subagents & Hidden Usage**: Expanded recursive scanning from depth 3 to depth 8 (capturing nested `<project>/<session>/subagents/workflows/wf_*/agent-*.jsonl` transcripts while safely scoping `subagents` detection inside discovered project roots), summed server-side `usage.iterations[]` (compaction / Advisor turns while preserving top-level 1h cache-write splits and iteration `thinking_tokens`), captured `output_tokens_details.thinking_tokens`, `speed: "fast"`, and `inference_geo: "us"`, and parsed leading `>16 KB` `file-history-snapshot` lines carrying `sessionId`.
+- **Codex Service Tiers & Edge-Case Accuracy**: Tracked `service_tier` (`priority` / `fast` = 2x, `flex` = 0.5x, plus `null` / `auto` / `default` resets) across `thread_settings_applied`, `turn_context`, `token_usage_record`, `token_count`, and `tc -> ur` handoffs, and handled legacy `last_usage_includes_reasoning === false` fallback entries.
+- **Antigravity Accounting & ReDoS Guard**: Bounded `MODEL_CHANGE_RE` to eliminate quadratic backtracking and prevent sentence-crossing captures, accepted terminal non-`DONE` (`ERROR`/`CANCELLED`) billed steps while still skipping in-flight statuses, guarded against whitespace-only `model` fields, backfilled earlier `unknown` steps via `firstModel` and widened `step_index <= 10` parent inheritance, and added `'tiered'` to allowed model suffixes.
+
+### Added
+- **Official Anthropic Claude 5 & Service-Tier Pricing**: Added official rates for `claude-opus-5`, `claude-fable-5-1`, and `claude-fable-5-2` in `core/rate-card.mjs`, plus official OpenAI/Anthropic Fast (`2x`), OpenAI Flex (`0.5x`), and Anthropic US residency (`1.1x`) multipliers (gated strictly to official catalog rates without polluting `pricing.override.json`).
+- **Multi-Account Local Profile Discovery**: Auto-discovers sibling local config directories (`~/.claude-*`, `~/.config/claude*`, `~/.codex-*`, `~/.gemini*`, plus delimiter-separated `CLAUDE_CONFIG_DIR` / `CODEX_HOME` overrides) deduplicated via `realpathSync`.
+- **One-Time Legacy v1 Antigravity Archive Import**: Non-destructively imports historical Antigravity sessions (and `parentSessionId` chains) from `~/.gemini/token-meter` (or `TOKEN_METER_LEGACY_AG_DIR`) that were later removed from live brain directories, never overwriting live v2/v3 events.
+
 ## 2.0.3 — File-Namespace Archive Preservation, Zero-Duplicate Hook Upgrades & Locked First-Model Backfill
 
 ### Fixed

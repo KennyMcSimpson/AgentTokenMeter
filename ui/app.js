@@ -37,8 +37,15 @@
       return window.sidecar?.conversationId || params.get('sessionId') || params.get('conversationId') || '';
     },
     async fetch(path, opts = {}) {
-      const fn = window.sidecar?.fetch ? window.sidecar.fetch.bind(window.sidecar) : fetch;
-      const res = await fn(path, opts);
+      if (window.sidecar?.fetch) {
+        // Strip non-structured-clonable AbortSignal before crossing host IPC/contextBridge boundaries;
+        // stale response ordering is already strictly guarded by `seq !== state.reqSeq`.
+        const { signal: _signal, ...safeOpts } = opts || {};
+        const res = await window.sidecar.fetch(path, safeOpts);
+        if (!res.ok) throw new Error(`${path}: HTTP ${res.status}`);
+        return res;
+      }
+      const res = await fetch(path, opts);
       if (!res.ok) throw new Error(`${path}: HTTP ${res.status}`);
       return res;
     },
@@ -130,11 +137,15 @@
     tab: 'overview',
     etag: '',
     reqSeq: 0,
+    inFlight: false,
+    abortController: null,
+    busyTimer: null,
     report: null,
     selectedDate: null,
     sessionSearch: '',
     sessionSort: 'cost',
     pollTimer: null,
+    pollGen: 0,
     toastTimer: null,
   };
 
@@ -146,8 +157,8 @@
     }
   };
 
-  async function getJson(path) {
-    const res = await HostBridge.fetch(path, { method: 'GET' });
+  async function getJson(path, opts = {}) {
+    const res = await HostBridge.fetch(path, { method: 'GET', ...opts });
     return res.json();
   }
 
@@ -671,7 +682,18 @@
   }
 
   // ---------- Polling & Actions ----------
-  async function loadReport({ force = false } = {}) {
+  async function loadReport({ force = false, noSync = false } = {}) {
+    if (state.abortController) {
+      try {
+        state.abortController.abort();
+      } catch {
+        // ignore abort cleanup errors
+      }
+    }
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    state.abortController = controller;
+    state.inFlight = true;
+
     const seq = ++state.reqSeq;
     const qs = new URLSearchParams({
       days: String(state.days),
@@ -683,9 +705,18 @@
     if (sid) qs.set('sessionId', sid);
     if (!force && state.etag) qs.set('etag', state.etag);
     if (force) qs.set('force', '1');
+    else if (noSync) qs.set('noSync', '1');
+
+    clearTimeout(state.busyTimer);
+    state.busyTimer = setTimeout(() => {
+      if (seq === state.reqSeq && state.inFlight) {
+        $('live-pill').classList.add('syncing');
+      }
+    }, 150);
 
     try {
-      const data = await getJson(`/api/report?${qs.toString()}`);
+      const fetchOpts = controller ? { signal: controller.signal } : {};
+      const data = await getJson(`/api/report?${qs.toString()}`, fetchOpts);
       if (seq !== state.reqSeq) return;
       const pill = $('live-pill');
       pill.classList.remove('syncing');
@@ -702,17 +733,38 @@
       state.etag = data.etag || '';
       renderAll(data);
     } catch (err) {
-      if (seq !== state.reqSeq) return;
+      if (err?.name === 'AbortError' || seq !== state.reqSeq) return;
+      $('live-pill').classList.remove('syncing');
       $('live-text').textContent = 'Offline';
       console.error('[agent-token-meter] poll failed:', err);
+    } finally {
+      if (seq === state.reqSeq) {
+        clearTimeout(state.busyTimer);
+        state.inFlight = false;
+        if (state.abortController === controller) {
+          state.abortController = null;
+        }
+      }
     }
   }
 
-  function schedulePoll() {
+  function cancelPoll() {
+    state.pollGen += 1;
     clearTimeout(state.pollTimer);
+    state.pollTimer = null;
+  }
+
+  function schedulePoll() {
+    cancelPoll();
+    const gen = state.pollGen;
     state.pollTimer = setTimeout(async () => {
-      await loadReport({ force: false });
-      schedulePoll();
+      if (gen !== state.pollGen) return;
+      if (state.inFlight) {
+        schedulePoll();
+        return;
+      }
+      await loadReport({ force: false, noSync: false });
+      if (gen === state.pollGen) schedulePoll();
     }, POLL_MS);
   }
 
@@ -735,25 +787,27 @@
 
   $('agent-group').querySelectorAll('.seg-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
+      cancelPoll();
       state.agent = btn.dataset.agent;
       state.etag = '';
       state.selectedDate = null;
       $('agent-group')
         .querySelectorAll('.seg-btn')
         .forEach((b) => b.classList.toggle('active', b === btn));
-      loadReport({ force: false });
+      loadReport({ force: false, noSync: true }).finally(schedulePoll);
     });
   });
 
   $('range-group').querySelectorAll('.seg-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
+      cancelPoll();
       state.days = Number(btn.dataset.days);
       state.etag = '';
       state.selectedDate = null;
       $('range-group')
         .querySelectorAll('.seg-btn')
         .forEach((b) => b.classList.toggle('active', b === btn));
-      loadReport({ force: false });
+      loadReport({ force: false, noSync: true }).finally(schedulePoll);
     });
   });
 
@@ -770,13 +824,16 @@
   $('btn-currency').addEventListener('click', async () => {
     if (!state.report) return;
     const next = state.report.prefs.currency === 'CNY' ? 'USD' : 'CNY';
+    cancelPoll();
     try {
       await postJson('/api/prefs', { currency: next });
       state.etag = '';
-      await loadReport({ force: false });
+      await loadReport({ force: false, noSync: true });
       showToast(`Currency switched to ${next}`);
     } catch (err) {
       showToast(`Switch failed: ${err.message}`);
+    } finally {
+      schedulePoll();
     }
   });
 
@@ -784,17 +841,18 @@
     const btn = $('btn-sync');
     btn.classList.add('spinning');
     $('live-pill').classList.add('syncing');
+    cancelPoll();
     try {
       const res = await postJson('/api/sync', { full: false });
       state.etag = '';
-      await loadReport({ force: false });
-      schedulePoll();
+      await loadReport({ force: false, noSync: true });
       showToast(res.added > 0 ? `Synced ${res.added} new record(s)` : 'Up to date');
     } catch (err) {
       showToast(`Sync failed: ${err.message}`);
     } finally {
       btn.classList.remove('spinning');
       $('live-pill').classList.remove('syncing');
+      schedulePoll();
     }
   });
 
@@ -834,5 +892,5 @@
   });
 
   // Boot
-  loadReport({ force: true }).then(schedulePoll);
+  loadReport({ force: false }).then(schedulePoll);
 })();

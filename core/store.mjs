@@ -2,7 +2,6 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, unlinkSync } from 
 import { join } from 'node:path';
 import {
   atomicWriteFile,
-  atomicWriteJson,
   canonicalFileKey,
   isPathInsideRoot,
   readJsonSafe,
@@ -54,7 +53,7 @@ export function normalizeEvent(raw) {
     return null;
   }
 
-  return {
+  const ev = {
     a: agent,
     c: raw.c,
     e: evId,
@@ -68,6 +67,12 @@ export function normalizeEvent(raw) {
     out: Math.max(0, Number(raw.out) || 0),
     r: Math.max(0, Number(raw.r) || 0),
   };
+  const rawSt = typeof raw.st === 'string' ? raw.st.trim().toLowerCase() : '';
+  if (rawSt === 'fast' || rawSt === 'priority') ev.st = 'fast';
+  else if (rawSt === 'flex') ev.st = 'flex';
+  const rawGeo = typeof raw.geo === 'string' ? raw.geo.trim().toLowerCase() : '';
+  if (rawGeo === 'us') ev.geo = 'us';
+  return ev;
 }
 
 function parseMonthFile(fullPath) {
@@ -131,15 +136,75 @@ export function readCursorsState(dataDir = getDataDir()) {
     };
   }
 
-  return { version: 2, files, sessions };
+  const out = { version: 2, files, sessions };
+  if (parsed.legacyAntigravityImported) {
+    out.legacyAntigravityImported = true;
+  }
+  return out;
+}
+
+function compactFilesForStorage(files) {
+  if (!files || typeof files !== 'object') return {};
+  const out = {};
+  for (const [fk, cursor] of Object.entries(files)) {
+    if (!cursor || typeof cursor !== 'object') continue;
+    // Immutable `.zst` archives are always re-decoded from byte 0 if their stat changes,
+    // so persisting incremental resume buffers (`seenTotals`, `recentUr`, etc.) only bloats cursors.json.
+    if (fk.toLowerCase().endsWith('.zst')) {
+      const {
+        prevTotals: _pt,
+        seenTotals: _st,
+        prevLastSig: _pl,
+        lastTcEmitted: _lt,
+        recentUr: _ru,
+        pendingUnknownEvents: _pu,
+        ...slim
+      } = cursor;
+      out[fk] = slim;
+    } else {
+      out[fk] = cursor;
+    }
+  }
+  return out;
 }
 
 export function writeCursorsState(dataDir, state) {
-  atomicWriteJson(cursorsPath(dataDir), {
+  const payload = {
     version: 2,
-    files: state.files || {},
+    files: compactFilesForStorage(state.files),
     sessions: state.sessions || {},
-  });
+  };
+  if (state.legacyAntigravityImported) {
+    payload.legacyAntigravityImported = true;
+  }
+  atomicWriteFile(cursorsPath(dataDir), JSON.stringify(payload) + '\n');
+  invalidateDirCache(dataDir);
+}
+
+export function readExistingEventKeys(dataDir = getDataDir()) {
+  const dir = eventsDir(dataDir);
+  const keys = new Set();
+  for (const name of safeReaddir(dir)) {
+    if (!name.endsWith('.jsonl')) continue;
+    for (const e of parseMonthFile(join(dir, name))) {
+      keys.add(eventKey(e));
+    }
+  }
+  return keys;
+}
+
+export function readEventsFromDir(targetDir, { filterAgent = '' } = {}) {
+  const dir = eventsDir(targetDir);
+  const dedup = new Map();
+  for (const name of safeReaddir(dir)
+    .filter((f) => f.endsWith('.jsonl'))
+    .sort()) {
+    for (const e of parseMonthFile(join(dir, name))) {
+      if (filterAgent && e.a !== filterAgent) continue;
+      dedup.set(eventKey(e), e);
+    }
+  }
+  return Array.from(dedup.values());
 }
 
 export function mergeSessionMeta(
@@ -189,6 +254,7 @@ export function appendEventsByMonth(dataDir, events) {
   for (const [month, lines] of byMonth.entries()) {
     appendFileSync(join(dir, `${month}.jsonl`), lines.join('\n') + '\n', 'utf-8');
   }
+  invalidateDirCache(dataDir);
 }
 
 function matchesReplaceScope(e, scope) {
@@ -292,14 +358,51 @@ export function compactEventsPreservingArchived(
     }
   }
 
+  invalidateDirCache(dataDir);
   return { survivingSessionKeys };
 }
 
 // Per-file parsed cache keyed by `mtimeMs:size:ino`
 const monthFileCache = new Map();
+// Read-only parsed sessions cache for `cursors.json`, keyed by canonical path
+const sessionsFileCache = new Map();
+// Whole-ledger assembled snapshot cache keyed by `${canonicalDir}|${monthsKey}`
+const MAX_SNAPSHOT_CACHE = 8;
+const ledgerSnapshotCache = new Map();
+
+function invalidateDirCache(dataDir) {
+  const dirKey = canonicalFileKey(dataDir);
+  const cPath = canonicalFileKey(cursorsPath(dataDir));
+  sessionsFileCache.delete(cPath);
+  for (const key of ledgerSnapshotCache.keys()) {
+    if (key.startsWith(`${dirKey}|`)) {
+      ledgerSnapshotCache.delete(key);
+    }
+  }
+}
 
 export function clearLedgerCache() {
   monthFileCache.clear();
+  sessionsFileCache.clear();
+  ledgerSnapshotCache.clear();
+}
+
+export function getLedgerFingerprint(dataDir = getDataDir(), { months = null } = {}) {
+  const dir = eventsDir(dataDir);
+  const allowedMonths = Array.isArray(months) && months.length > 0 ? new Set(months.map((m) => `${m}.jsonl`)) : null;
+  const allDiskFiles = safeReaddir(dir)
+    .filter((f) => f.endsWith('.jsonl'))
+    .sort();
+  const files = allowedMonths ? allDiskFiles.filter((f) => allowedMonths.has(f)) : allDiskFiles;
+  const fpParts = [];
+  for (const name of files) {
+    const st = safeStat(join(dir, name));
+    if (!st) continue;
+    fpParts.push(`${name}=${st.mtimeMs}:${st.size}:${st.ino}`);
+  }
+  const cs = safeStat(cursorsPath(dataDir));
+  const cursorsStamp = cs ? `${cs.mtimeMs}:${cs.size}:${cs.ino}` : 'none';
+  return `${fpParts.join('|')}|p=${prefsMtime(dataDir)}|c=${cursorsStamp}`;
 }
 
 export function loadLedger(dataDir = getDataDir(), { months = null } = {}) {
@@ -318,16 +421,37 @@ export function loadLedger(dataDir = getDataDir(), { months = null } = {}) {
   }
 
   const files = allowedMonths ? allDiskFiles.filter((f) => allowedMonths.has(f)) : allDiskFiles;
-  const dedup = new Map();
+  const fileEntries = [];
   const fpParts = [];
 
   for (const name of files) {
     const fullPath = join(dir, name);
     const st = safeStat(fullPath);
     if (!st) continue;
-
     const key = `${st.mtimeMs}:${st.size}:${st.ino}`;
     fpParts.push(`${name}=${key}`);
+    fileEntries.push({ fullPath, key });
+  }
+
+  const cPath = cursorsPath(dataDir);
+  const cs = safeStat(cPath);
+  const cursorsStamp = cs ? `${cs.mtimeMs}:${cs.size}:${cs.ino}` : 'none';
+  const dataStamp = `${fpParts.join('|')}|c=${cursorsStamp}`;
+  const fingerprint = `${fpParts.join('|')}|p=${prefsMtime(dataDir)}|c=${cursorsStamp}`;
+
+  const monthsKey = allowedMonths ? Array.from(allowedMonths).sort().join(',') : '*';
+  const snapKey = `${canonicalFileKey(dataDir)}|${monthsKey}`;
+  const cachedSnap = ledgerSnapshotCache.get(snapKey);
+  if (cachedSnap && cachedSnap.dataStamp === dataStamp) {
+    return {
+      events: cachedSnap.events,
+      sessions: cachedSnap.sessions,
+      fingerprint,
+    };
+  }
+
+  const dedup = new Map();
+  for (const { fullPath, key } of fileEntries) {
     let cached = monthFileCache.get(fullPath);
     if (!cached || cached.key !== key) {
       cached = { key, events: parseMonthFile(fullPath) };
@@ -338,17 +462,35 @@ export function loadLedger(dataDir = getDataDir(), { months = null } = {}) {
     }
   }
 
-  const state = readCursorsState(dataDir);
-  const cs = safeStat(cursorsPath(dataDir));
-  const cursorsStamp = cs ? `${cs.mtimeMs}:${cs.size}` : 'none';
+  const cCanon = canonicalFileKey(cPath);
+  let cachedSessions = sessionsFileCache.get(cCanon);
+  if (!cachedSessions || cachedSessions.stamp !== cursorsStamp) {
+    const state = readCursorsState(dataDir);
+    cachedSessions = { stamp: cursorsStamp, sessions: state.sessions };
+    if (sessionsFileCache.size >= MAX_SNAPSHOT_CACHE && !sessionsFileCache.has(cCanon)) {
+      const oldest = sessionsFileCache.keys().next().value;
+      if (oldest !== undefined) sessionsFileCache.delete(oldest);
+    }
+    sessionsFileCache.set(cCanon, cachedSessions);
+  }
+
   const events = Array.from(dedup.values()).sort(
     (a, b) => a.ts - b.ts || (a.a < b.a ? -1 : a.a > b.a ? 1 : 0) || (a.e < b.e ? -1 : a.e > b.e ? 1 : 0),
   );
-  const fingerprint = `${fpParts.join('|')}|p=${prefsMtime(dataDir)}|c=${cursorsStamp}`;
+
+  if (ledgerSnapshotCache.size >= MAX_SNAPSHOT_CACHE && !ledgerSnapshotCache.has(snapKey)) {
+    const oldestKey = ledgerSnapshotCache.keys().next().value;
+    if (oldestKey !== undefined) ledgerSnapshotCache.delete(oldestKey);
+  }
+  ledgerSnapshotCache.set(snapKey, {
+    dataStamp,
+    events,
+    sessions: cachedSessions.sessions,
+  });
 
   return {
     events,
-    sessions: state.sessions,
+    sessions: cachedSessions.sessions,
     fingerprint,
   };
 }

@@ -5,12 +5,6 @@ import { createApiController } from '../../server/api.mjs';
 const api = createApiController({
   defaultAgent: process.env.TOKEN_METER_DEFAULT_AGENT || 'antigravity',
 });
-const initRes = api.runSync({ force: true, full: false, throwOnError: false });
-const st = api.getStatus();
-console.log(
-  `[agent_token_meter] ready: dataDir=${getDataDir()}`,
-  initRes ? `sources=${initRes.totalSources} added=${initRes.added}` : `syncError=${st.lastSyncError}`,
-);
 
 const app = new SidecarApp();
 
@@ -50,4 +44,19 @@ app.api('/api/prefs', (data) => api.handleSavePrefs(data || {}), 'POST');
 
 app.api('/api/sync', (data) => api.handleSync(data || {}), 'POST');
 
-app.run();
+// Start listening immediately so host startup never times out on large initial backfills;
+// run an incremental warmup sync right after binding if no client request already triggered one.
+app.run().then(() => {
+  setTimeout(() => {
+    const initRes = api.runSync({ force: false, full: false, throwOnError: false });
+    const st = api.getStatus();
+    console.log(
+      `[agent_token_meter] ready: dataDir=${getDataDir()}`,
+      initRes
+        ? `sources=${initRes.totalSources} added=${initRes.added}`
+        : st.lastSyncError
+          ? `syncError=${st.lastSyncError}`
+          : 'sync=cached',
+    );
+  }, 100);
+});

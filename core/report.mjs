@@ -12,7 +12,10 @@ import {
 import { loadLedger, sessionKey } from './store.mjs';
 
 const MAX_RANGE_DAYS = 3650;
+const MAX_TZ_CACHE_ZONES = 64;
+const MAX_TZ_HOUR_SLOTS = 8192;
 const tzFormatterCache = new Map();
+const tzHourCache = new Map();
 
 export function resolveTimeZone(tz) {
   const candidate =
@@ -30,6 +33,10 @@ export function resolveTimeZone(tz) {
 export function localDateKey(tsMs, timeZone = resolveTimeZone()) {
   let fmt = tzFormatterCache.get(timeZone);
   if (!fmt) {
+    if (tzFormatterCache.size >= MAX_TZ_CACHE_ZONES) {
+      tzFormatterCache.clear();
+      tzHourCache.clear();
+    }
     fmt = new Intl.DateTimeFormat('en-CA', {
       timeZone,
       year: 'numeric',
@@ -38,7 +45,32 @@ export function localDateKey(tsMs, timeZone = resolveTimeZone()) {
     });
     tzFormatterCache.set(timeZone, fmt);
   }
-  return fmt.format(tsMs);
+  if (!Number.isInteger(tsMs) || tsMs < 0 || tsMs > 8.63e15) {
+    return fmt.format(tsMs);
+  }
+  let hourMap = tzHourCache.get(timeZone);
+  if (!hourMap) {
+    hourMap = new Map();
+    tzHourCache.set(timeZone, hourMap);
+  }
+  const hourSlot = Math.floor(tsMs / 3_600_000);
+  if (hourMap.has(hourSlot)) {
+    const cached = hourMap.get(hourSlot);
+    return cached !== null ? cached : fmt.format(tsMs);
+  }
+  // Probe start, midpoint (+30m), and end (+59m59.999s) of the UTC hour.
+  // Because no IANA DST shift is < 30m, equal dates at all three points guarantee
+  // a constant local calendar date for every integer millisecond in this hour.
+  const slotStart = hourSlot * 3_600_000;
+  const d0 = fmt.format(slotStart);
+  const d1 = fmt.format(slotStart + 1_800_000);
+  const d2 = fmt.format(slotStart + 3_599_999);
+  const constant = d0 === d1 && d1 === d2 ? d0 : null;
+  if (hourMap.size >= MAX_TZ_HOUR_SLOTS) {
+    hourMap.clear();
+  }
+  hourMap.set(hourSlot, constant);
+  return constant !== null ? constant : fmt.format(tsMs);
 }
 
 function addDaysUtcDateStr(dateStr, deltaDays) {
@@ -182,15 +214,22 @@ export function buildReport({
     const norm = normalizeModel(rawModel);
     if (norm !== 'unknown') return norm;
     if (evAgent === 'codex') {
-      const sMeta = sessions[sessionKey(evAgent, sid)];
+      const cacheKey = sessionKey(evAgent, sid);
+      if (inheritedModelCache.has(cacheKey)) return inheritedModelCache.get(cacheKey);
+      const sMeta = sessions[cacheKey];
       const fm = normalizeModel(sMeta?.firstModel);
-      if (fm !== 'unknown') return fm;
-      const lm = normalizeModel(sMeta?.lastModel);
-      return lm !== 'unknown' ? lm : 'unknown';
+      const resolved = fm !== 'unknown' ? fm : normalizeModel(sMeta?.lastModel);
+      inheritedModelCache.set(cacheKey, resolved);
+      return resolved;
     }
     if (evAgent !== 'antigravity') return norm;
     const cacheKey = sessionKey(evAgent, sid);
     if (inheritedModelCache.has(cacheKey)) return inheritedModelCache.get(cacheKey);
+    const selfFirst = normalizeModel(sessions[cacheKey]?.firstModel);
+    if (selfFirst !== 'unknown') {
+      inheritedModelCache.set(cacheKey, selfFirst);
+      return selfFirst;
+    }
     let cur = sid;
     const visited = new Set([sid]);
     let found = 'unknown';
@@ -199,7 +238,8 @@ export function buildReport({
       const parent = meta?.parentSessionId;
       if (!parent || visited.has(parent)) break;
       visited.add(parent);
-      const pm = normalizeModel(sessions[sessionKey(evAgent, parent)]?.lastModel);
+      const pMeta = sessions[sessionKey(evAgent, parent)];
+      const pm = normalizeModel(pMeta?.lastModel || pMeta?.firstModel);
       if (pm !== 'unknown') {
         found = pm;
         break;
@@ -217,16 +257,27 @@ export function buildReport({
   for (const e of events) {
     if (!allowedSet.has(e.a)) continue;
     availableAgentSet.add(e.a);
+    const dateStr = localDateKey(e.ts, resolvedTz);
+    // For bounded windows (`days > 0`), exclude future-dated events so `period` and `daily` always reconcile
+    const inPeriod = days === 0 || (dateStr >= startDateStr && dateStr <= todayStr);
+    const matchesAgent = agentFilter === 'all' || e.a === agentFilter;
+    // Skip pricing work for events that affect neither the selected agent nor the per-agent period breakdown
+    if (!inPeriod && !matchesAgent) continue;
+
     const model = resolveEventModel(e.a, e.c, e.m);
     const promptTotal = e.in + e.cr + e.cw5 + e.cw1h;
-    const rate = resolveModelRate(model, { ts: e.ts, promptTotal, agent: e.a, overrides });
+    const rate = resolveModelRate(model, {
+      ts: e.ts,
+      promptTotal,
+      agent: e.a,
+      serviceTier: e.st || '',
+      inferenceGeo: e.geo || '',
+      overrides,
+    });
     const cost = calcCostUsd(
       { input: e.in, cacheRead: e.cr, cacheWrite5m: e.cw5, cacheWrite1h: e.cw1h, output: e.out },
       rate,
     );
-    const dateStr = localDateKey(e.ts, resolvedTz);
-    // For bounded windows (`days > 0`), exclude future-dated events so `period` and `daily` always reconcile
-    const inPeriod = days === 0 || (dateStr >= startDateStr && dateStr <= todayStr);
 
     if (inPeriod) {
       let aEntry = agentMap.get(e.a);
@@ -243,7 +294,7 @@ export function buildReport({
       aEntry.sessionIds.add(e.c);
     }
 
-    if (agentFilter !== 'all' && e.a !== agentFilter) continue;
+    if (!matchesAgent) continue;
 
     allTimeFilteredEvents += 1;
     allTimeFilteredSessions.add(sessionKey(e.a, e.c));
@@ -295,10 +346,19 @@ export function buildReport({
         tierNote: displayRate.tierNote,
         matchType: displayRate.matchType,
         matchedRule: displayRate.matchedRule,
+        fastSteps: 0,
+        flexSteps: 0,
       };
       modelMap.set(modelBucketKey, mEntry);
     }
     mEntry.agents.add(e.a);
+    if (rate.matchType === 'official') {
+      if (e.st === 'fast' && (rate.provider === 'openai' || rate.provider === 'anthropic')) {
+        mEntry.fastSteps += 1;
+      } else if (e.st === 'flex' && rate.provider === 'openai') {
+        mEntry.flexSteps += 1;
+      }
+    }
     accumulate(mEntry, e, cost);
 
     // Session bucket
@@ -374,8 +434,13 @@ export function buildReport({
   const models = Array.from(modelMap.values())
     .map((m) => {
       const { agents: agentSet, ...rest } = m;
+      const tierExtras = [];
+      if (m.fastSteps > 0) tierExtras.push(`${m.fastSteps} fast 2x`);
+      if (m.flexSteps > 0) tierExtras.push(`${m.flexSteps} flex 0.5x`);
+      const tierNote = tierExtras.length ? `${rest.tierNote} (${tierExtras.join(', ')})` : rest.tierNote;
       return {
         ...finalizeBucket(rest),
+        tierNote,
         agents: Array.from(agentSet).sort(),
         sharePct: periodFinal.costUsd > 0 ? (m.costUsd / periodFinal.costUsd) * 100 : 0,
       };
@@ -450,9 +515,11 @@ export function buildReport({
     if (!availableAgents.includes(id)) availableAgents.push(id);
   }
 
+  const utcDay = new Date(now).toISOString().slice(0, 10);
+
   return {
     generatedAt: now,
-    etag: `${fingerprint}|today=${todayStr}|d=${days}|tz=${resolvedTz}|al=${allowedList.join(',')}|a=${agentFilter}|c=${activeSessionId}`,
+    etag: `${fingerprint}|today=${todayStr}|ud=${utcDay}|d=${days}|tz=${resolvedTz}|al=${allowedList.join(',')}|a=${agentFilter}|c=${activeSessionId}`,
     todayDate: todayStr,
     rangeDays: days,
     timeZone: resolvedTz,

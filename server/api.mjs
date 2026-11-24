@@ -2,12 +2,16 @@ import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getEnabledAgentIds, normalizeAgentId } from '../adapters/index.mjs';
+import { canonicalFileKey } from '../core/fs-utils.mjs';
 import { getDataDir, savePrefs } from '../core/pricing.mjs';
-import { buildReport, exportDailyCsv, normalizeAgentFilter } from '../core/report.mjs';
+import { buildReport, exportDailyCsv, localDateKey, normalizeAgentFilter, resolveTimeZone } from '../core/report.mjs';
+import { getLedgerFingerprint } from '../core/store.mjs';
 import { syncAllSources } from '../core/sync.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const UI_DIR = resolve(__dirname, '..', 'ui');
+const MAX_REPORT_CACHE_ENTRIES = 16;
+const MAX_RANGE_DAYS = 3650;
 
 export function createApiController({
   dataDir = null,
@@ -17,6 +21,7 @@ export function createApiController({
 } = {}) {
   let lastSyncAt = 0;
   let lastSyncError = '';
+  const reportCache = new Map();
 
   const enabledIds = getEnabledAgentIds();
   const resolvedLocked =
@@ -53,6 +58,9 @@ export function createApiController({
       });
       lastSyncAt = Date.now();
       lastSyncError = '';
+      if (res && (res.changedFiles > 0 || res.added > 0 || full)) {
+        reportCache.clear();
+      }
       return res;
     } catch (err) {
       lastSyncError = err?.message || String(err);
@@ -84,10 +92,16 @@ export function createApiController({
 
   function handleReport(params = {}, defaultActiveSessionId = '') {
     const force = params.force === '1' || params.force === 'true';
-    runSync({ force, full: false, throwOnError: false });
+    const noSync = !force && (params.noSync === '1' || params.noSync === 'true');
+    if (!noSync) {
+      runSync({ force, full: false, throwOnError: false });
+    }
 
-    const days = params.days !== undefined && params.days !== '' ? Number(params.days) : 7;
+    const rawDays = params.days !== undefined && params.days !== '' ? Number(params.days) : 7;
+    const days =
+      Number.isFinite(rawDays) && rawDays >= 0 ? Math.min(Math.floor(rawDays), MAX_RANGE_DAYS) : 7;
     const tz = typeof params.tz === 'string' && params.tz.trim() ? params.tz.trim() : undefined;
+    const resolvedTz = resolveTimeZone(tz);
     const agent = resolveEffectiveAgent(params.agent);
     const activeSessionId =
       (typeof params.sessionId === 'string' && params.sessionId) ||
@@ -95,14 +109,40 @@ export function createApiController({
       defaultActiveSessionId ||
       '';
 
-    const report = buildReport({
-      dataDir: resolveDir(),
-      rangeDays: Number.isFinite(days) ? days : 7,
-      timeZone: tz,
-      agent,
-      allowedAgents,
-      activeSessionId,
-    });
+    const dir = resolveDir();
+    const dirKey = canonicalFileKey(dir);
+    const now = Date.now();
+    const todayStr = localDateKey(now, resolvedTz);
+    const utcDay = new Date(now).toISOString().slice(0, 10);
+    const ledgerFp = getLedgerFingerprint(dir);
+    const baseEtag = `${ledgerFp}|today=${todayStr}|ud=${utcDay}|d=${days}|tz=${resolvedTz}|al=${allowedAgents.join(',')}|a=${agent}|c=${activeSessionId}`;
+    const expectedEtag = `${baseEtag}|lk=${resolvedLocked}|se=${lastSyncError ? '1' : '0'}`;
+    const cacheKey = `${dirKey}|${baseEtag}`;
+
+    if (params.etag && params.etag === expectedEtag) {
+      return { unchanged: true, etag: expectedEtag, syncedAt: lastSyncAt, syncError: lastSyncError || null };
+    }
+
+    let report = reportCache.get(cacheKey);
+    if (report) {
+      // Refresh LRU order
+      reportCache.delete(cacheKey);
+      reportCache.set(cacheKey, report);
+    } else {
+      report = buildReport({
+        dataDir: dir,
+        rangeDays: days,
+        timeZone: resolvedTz,
+        agent,
+        allowedAgents,
+        activeSessionId,
+      });
+      if (reportCache.size >= MAX_REPORT_CACHE_ENTRIES) {
+        const oldestKey = reportCache.keys().next().value;
+        if (oldestKey !== undefined) reportCache.delete(oldestKey);
+      }
+      reportCache.set(`${dirKey}|${report.etag}`, report);
+    }
 
     const etag = `${report.etag}|lk=${resolvedLocked}|se=${lastSyncError ? '1' : '0'}`;
     if (params.etag && params.etag === etag) {
@@ -141,6 +181,7 @@ export function createApiController({
 
   function handleSavePrefs(body = {}) {
     const saved = savePrefs(body || {}, resolveDir());
+    reportCache.clear();
     return { ok: true, prefs: saved };
   }
 
