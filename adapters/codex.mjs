@@ -13,6 +13,7 @@ const LAST_DUP_WINDOW_MS = 10_000;
 const TC_UR_HANDOFF_WINDOW_MS = 2_000;
 const MAX_SEEN_TOTALS = 256;
 const MAX_RECENT_UR = 64;
+const MAX_PENDING_UNKNOWN = 128;
 const FAST_SKIP_LINE_BYTES = 16 * 1024;
 const CODEX_EXTENSIONS = ['.jsonl', '.jsonl.zst'];
 
@@ -273,6 +274,7 @@ export const codexAdapter = {
     let sessionId = '';
     let parentSessionId = '';
     let sessionMetaSeen = false;
+    let firstModel = '';
     let lastModel = '';
     let title = '';
     let firstTs = 0;
@@ -287,7 +289,8 @@ export const codexAdapter = {
     let hasUsageRecords = false;
 
     const events = [];
-    const pendingUnknownEvents = [];
+    let persistedPendingUnknown = [];
+    const inBatchPendingUnknown = [];
 
     const rememberTotal = (t) => {
       const sig = totalSig(t);
@@ -328,12 +331,23 @@ export const codexAdapter = {
 
     const noteResolvedModel = (m) => {
       if (!m) return;
+      if (!firstModel) firstModel = m;
       lastModel = m;
-      if (pendingUnknownEvents.length > 0) {
-        for (const ev of pendingUnknownEvents) {
+      // Backfill earlier-batch unknown events directly into this batch's emitted events (LWW ledger update)
+      if (persistedPendingUnknown.length > 0) {
+        for (const ev of persistedPendingUnknown) {
+          if (ev && ev.m === 'unknown') {
+            ev.m = m;
+            events.push(ev);
+          }
+        }
+        persistedPendingUnknown.length = 0;
+      }
+      if (inBatchPendingUnknown.length > 0) {
+        for (const ev of inBatchPendingUnknown) {
           if (ev.m === 'unknown') ev.m = m;
         }
-        pendingUnknownEvents.length = 0;
+        inBatchPendingUnknown.length = 0;
       }
     };
 
@@ -350,6 +364,7 @@ export const codexAdapter = {
         typeof prev.parentSessionId === 'string' ? prev.parentSessionId : meta.parentSessionId || '';
       sessionMetaSeen = Boolean(prev.sessionMetaSeen);
       lastModel = typeof prev.lastModel === 'string' ? prev.lastModel : '';
+      firstModel = typeof prev.firstModel === 'string' && prev.firstModel ? prev.firstModel : lastModel;
       title = typeof prev.title === 'string' ? prev.title : '';
       firstTs = Number(prev.firstTs) || 0;
       lastTs = Number(prev.lastTs) || 0;
@@ -391,6 +406,9 @@ export const codexAdapter = {
             }
           : null;
       recentUr = Array.isArray(prev.recentUr) ? [...prev.recentUr] : [];
+      persistedPendingUnknown = Array.isArray(prev.pendingUnknownEvents)
+        ? prev.pendingUnknownEvents.filter((e) => e && typeof e === 'object').map((e) => ({ ...e }))
+        : [];
       deltaSeq = Number.isInteger(prev.deltaSeq) && prev.deltaSeq >= 0 ? prev.deltaSeq : 0;
       hasUsageRecords = Boolean(prev.hasUsageRecords);
     };
@@ -484,6 +502,7 @@ export const codexAdapter = {
           lastTcEmitted.r === norm.r
         ) {
           lastTcEmitted = null;
+          if (rec.model) noteResolvedModel(rec.model);
           if (rec.responseId) {
             rememberUr({ rid: rec.responseId, ts, ...norm });
           }
@@ -518,7 +537,9 @@ export const codexAdapter = {
           r: norm.r,
         };
         events.push(ev);
-        if (model === 'unknown') pendingUnknownEvents.push(ev);
+        if (model === 'unknown') {
+          inBatchPendingUnknown.push(ev);
+        }
         return;
       }
 
@@ -646,7 +667,9 @@ export const codexAdapter = {
         r: norm.r,
       };
       events.push(ev);
-      if (model === 'unknown') pendingUnknownEvents.push(ev);
+      if (model === 'unknown') {
+        inBatchPendingUnknown.push(ev);
+      }
     };
 
     const delta = readJsonlDelta(filePath, prevCursor, effectiveForceFull, {
@@ -656,6 +679,8 @@ export const codexAdapter = {
     });
     if (!delta) return null;
     if (delta.unchanged) return { unchanged: true };
+
+    const remainingPending = [...persistedPendingUnknown, ...inBatchPendingUnknown].slice(0, MAX_PENDING_UNKNOWN);
 
     return {
       unchanged: false,
@@ -673,6 +698,7 @@ export const codexAdapter = {
         mtimeMs: delta.stat.mtimeMs,
         ino: delta.stat.ino,
         offset: delta.newOffset,
+        firstModel,
         lastModel,
         title,
         firstTs,
@@ -682,6 +708,7 @@ export const codexAdapter = {
         prevLastSig,
         lastTcEmitted,
         recentUr,
+        pendingUnknownEvents: remainingPending,
         deltaSeq,
         hasUsageRecords,
       },

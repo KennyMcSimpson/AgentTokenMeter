@@ -62,7 +62,7 @@ function openaiTiered272k(
       cacheWrite1h: roundRate(effIn * cacheWrite12hMult),
       output: effOut,
       tierNote: isLong
-        ? `OpenAI official long-context (>272K${cwNote})`
+        ? `OpenAI official long-context (>272K${cacheWrite30mMult > 1 ? `; est. ${cacheWrite30mMult}x long-ctx cache write` : ''})`
         : `OpenAI official (${cacheLabel}${cwNote}; <=272K / >272K tiered)`,
     };
   };
@@ -348,7 +348,10 @@ export const OFFICIAL_PRICING_RULES = [
     provider: 'openai',
     prefix: 'gpt-5.5',
     family: 'GPT-5.5',
-    resolve: openaiTiered272k(5.0, 0.5, 30.0, '90% cache discount'),
+    resolve: openaiTiered272k(5.0, 0.5, 30.0, '90% cache discount', {
+      cacheWrite30mMult: 1.0,
+      cacheWrite12hMult: 1.0,
+    }),
   },
   {
     provider: 'openai',

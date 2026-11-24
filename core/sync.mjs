@@ -21,12 +21,44 @@ function needsParserUpgrade(adapter, prevCursor) {
   return false;
 }
 
-function collectLegacySessionIds(prevCursor) {
+function makeScope(agent, sessionId, rolloutId = '') {
+  if (!agent || !sessionId) return null;
+  return {
+    agent,
+    sessionId,
+    rolloutId: agent === 'codex' ? String(rolloutId || '').toLowerCase() : '',
+  };
+}
+
+function scopeKey(s) {
+  return `${s.agent}|${s.sessionId}|${s.rolloutId || ''}`;
+}
+
+function addScope(map, scope) {
+  if (!scope) return;
+  map.set(scopeKey(scope), scope);
+}
+
+function cursorScope(agent, cursor) {
+  if (!cursor || typeof cursor !== 'object') return null;
+  if (cursor.agent && cursor.agent !== agent) return null;
+  if (typeof cursor.sessionId !== 'string' || !cursor.sessionId) return null;
+  return makeScope(agent, cursor.sessionId, cursor.rolloutId || '');
+}
+
+function collectLegacyScopes(agent, cursor) {
   const out = [];
-  if (!prevCursor || typeof prevCursor !== 'object') return out;
-  if (Array.isArray(prevCursor.legacySessionIds)) {
-    for (const id of prevCursor.legacySessionIds) {
-      if (typeof id === 'string' && id) out.push(id);
+  if (!cursor || typeof cursor !== 'object') return out;
+  if (Array.isArray(cursor.legacyScopes)) {
+    for (const s of cursor.legacyScopes) {
+      const norm = makeScope(agent, s?.sessionId, s?.rolloutId || '');
+      if (norm) out.push(norm);
+    }
+  }
+  if (Array.isArray(cursor.legacySessionIds)) {
+    for (const id of cursor.legacySessionIds) {
+      const norm = makeScope(agent, id, '');
+      if (norm) out.push(norm);
     }
   }
   return out;
@@ -68,6 +100,7 @@ export function syncSingleSource(
 
   const fileKey = canonicalFileKey(filePath);
   const lockOpts = lockWaitMs !== undefined ? { waitMs: lockWaitMs } : undefined;
+  const fastStatuslineMode = lockWaitMs !== undefined && lockWaitMs < 1000;
 
   return withLock(
     dataDir,
@@ -90,33 +123,90 @@ export function syncSingleSource(
       if (res.unchanged) {
         return { agent: adapter.id, added: 0, scanned: 1 };
       }
+
+      if (sameAgentVersionUpgrade) {
+        const targetScopes = new Map();
+        const prevSc = cursorScope(adapter.id, prevCursor);
+        addScope(targetScopes, prevSc);
+        for (const ls of collectLegacyScopes(adapter.id, prevCursor)) addScope(targetScopes, ls);
+        const newSc = makeScope(
+          adapter.id,
+          res.cursor.sessionId || meta.sessionId,
+          res.cursor.rolloutId || meta.rolloutId || '',
+        );
+        addScope(targetScopes, newSc);
+
+        let hasSiblingInScope = false;
+        for (const [fk, otherCursor] of Object.entries(state.files)) {
+          if (fk === fileKey || !existsSync(fk)) continue;
+          const os = cursorScope(adapter.id, otherCursor);
+          if (os && targetScopes.has(scopeKey(os))) {
+            hasSiblingInScope = true;
+            break;
+          }
+          for (const ls of collectLegacyScopes(adapter.id, otherCursor)) {
+            if (targetScopes.has(scopeKey(ls))) {
+              hasSiblingInScope = true;
+              break;
+            }
+          }
+          if (hasSiblingInScope) break;
+        }
+
+        if (!hasSiblingInScope && !fastStatuslineMode) {
+          // Safe to atomically replace this file's isolated legacy scope right now,
+          // preventing any temporary double-counting in `summary --no-sync`.
+          const { survivingSessionKeys } = compactEventsPreservingArchived(dataDir, res.events, {
+            replaceScopes: targetScopes,
+          });
+          state.files[fileKey] = res.cursor;
+          mergeSessionMeta(state, {
+            agent: adapter.id,
+            sessionId: res.cursor.sessionId || meta.sessionId,
+            app: res.cursor.app || meta.app || adapter.id,
+            title: res.cursor.title,
+            parentSessionId: res.cursor.parentSessionId || meta.parentSessionId,
+            firstModel: res.cursor.firstModel,
+            lastModel: res.cursor.lastModel,
+            firstTs: res.cursor.firstTs,
+            lastTs: res.cursor.lastTs,
+          });
+          for (const s of targetScopes.values()) {
+            const sk = sessionKey(s.agent, s.sessionId);
+            if (!survivingSessionKeys.has(sk)) {
+              delete state.sessions[sk];
+            }
+          }
+          writeCursorsState(dataDir, state);
+          return { agent: adapter.id, added: res.events.length, scanned: 1 };
+        }
+
+        // Another file shares the legacy scope (e.g., v2.0.0 fork collision) or fast statusline lock:
+        // defer both ledger write and version bump to the next `syncAllSources()` so no duplicate
+        // events temporarily appear in `summary --no-sync`.
+        const legacyMap = new Map();
+        for (const ls of collectLegacyScopes(adapter.id, prevCursor)) addScope(legacyMap, ls);
+        addScope(legacyMap, prevSc);
+        state.files[fileKey] = {
+          ...prevCursor,
+          parserVersion: Number(prevCursor.parserVersion) || 0,
+          legacyScopes: Array.from(legacyMap.values()),
+        };
+        writeCursorsState(dataDir, state);
+        return { agent: adapter.id, added: 0, scanned: 1, deferredUpgrade: true };
+      }
+
       if (res.events.length) {
         appendEventsByMonth(dataDir, res.events);
       }
-
-      // Single-file hooks cannot safely purge sibling session keys in the ledger.
-      // When upgrading a legacy cursor in-place, defer bumping `parserVersion` and record
-      // prior session IDs so the next `syncAllSources()` performs atomic full-session cleanup.
-      let cursorToSave = res.cursor;
-      if (sameAgentVersionUpgrade) {
-        const legacySet = new Set(collectLegacySessionIds(prevCursor));
-        if (typeof prevCursor.sessionId === 'string' && prevCursor.sessionId) {
-          legacySet.add(prevCursor.sessionId);
-        }
-        cursorToSave = {
-          ...res.cursor,
-          parserVersion: Number(prevCursor.parserVersion) || 0,
-          legacySessionIds: Array.from(legacySet),
-        };
-      }
-
-      state.files[fileKey] = cursorToSave;
+      state.files[fileKey] = res.cursor;
       mergeSessionMeta(state, {
         agent: adapter.id,
         sessionId: res.cursor.sessionId || meta.sessionId,
         app: res.cursor.app || meta.app || adapter.id,
         title: res.cursor.title,
         parentSessionId: res.cursor.parentSessionId || meta.parentSessionId,
+        firstModel: res.cursor.firstModel,
         lastModel: res.cursor.lastModel,
         firstTs: res.cursor.firstTs,
         lastTs: res.cursor.lastTs,
@@ -130,10 +220,12 @@ export function syncSingleSource(
 
 /**
  * Scan all configured agent adapters and persist new token events atomically.
- * - Automatically detects legacy cursors needing a parser upgrade (including those touched first
- *   by `syncSingleSource`), convergently rescans all sibling files sharing affected sessions, and
- *   replaces stale misattributed events while preserving archived events from deleted transcripts.
- * - Reports any unreadable/over-cap source files in `skipped` / `skippedFiles` instead of dropping silently.
+ * - Replaces ledger entries strictly by file-level namespace `(agent, sessionId, rolloutId)`,
+ *   preserving archived events from deleted transcripts — including deleted sibling rollouts
+ *   sharing a Codex thread ID.
+ * - Automatically detects legacy cursors needing a parser upgrade, convergently rescans all
+ *   live files sharing affected namespaces, and removes vacated ghost sessions cleanly.
+ * - Reports any unreadable/over-cap source files in `skipped` / `skippedFiles`.
  */
 export function syncAllSources({ forceFullRescan = false, agents = null, dataDir = getDataDir(), lockWaitMs } = {}) {
   const selectedAdapters = getAdapters(agents);
@@ -156,31 +248,27 @@ export function syncAllSources({ forceFullRescan = false, agents = null, dataDir
       const state = readCursorsState(dataDir);
       const newEvents = [];
       const skippedFiles = [];
-      const failedSessionKeys = new Set();
-      const replaceSessionKeys = new Set();
+      const failedScopes = new Map();
+      const replaceScopes = new Map();
       const rebuiltSessionMeta = new Map();
       const fullScannedFileKeys = new Set();
       const failedFileKeys = new Set();
       let changedFiles = 0;
       let upgradedAny = false;
 
-      // Identify sessions impacted by parser upgrades so every live file sharing an upgraded
-      // sessionId is rescanned together and stale misattributed ledger entries can be cleanly replaced.
-      const upgradeSessionKeys = new Set();
+      // Identify file namespaces impacted by parser upgrades so every live file sharing an
+      // upgraded namespace is rescanned together and stale misattributed keys are replaced cleanly.
+      const upgradeScopes = new Map();
       if (!forceFullRescan) {
         for (const { adapter, item } of discovered) {
           const prevCursor = state.files[canonicalFileKey(item.filePath)];
           if (needsParserUpgrade(adapter, prevCursor)) {
             upgradedAny = true;
-            if (prevCursor?.sessionId) {
-              upgradeSessionKeys.add(sessionKey(adapter.id, prevCursor.sessionId));
+            addScope(upgradeScopes, cursorScope(adapter.id, prevCursor));
+            for (const ls of collectLegacyScopes(adapter.id, prevCursor)) {
+              addScope(upgradeScopes, ls);
             }
-            for (const lid of collectLegacySessionIds(prevCursor)) {
-              upgradeSessionKeys.add(sessionKey(adapter.id, lid));
-            }
-            if (item.sessionId) {
-              upgradeSessionKeys.add(sessionKey(adapter.id, item.sessionId));
-            }
+            addScope(upgradeScopes, makeScope(adapter.id, item.sessionId, item.rolloutId || ''));
           }
         }
       }
@@ -188,8 +276,9 @@ export function syncAllSources({ forceFullRescan = false, agents = null, dataDir
       const scanDiscoveredItem = ({ adapter, item }, itemForceFull) => {
         const fileKey = canonicalFileKey(item.filePath);
         const prevCursor = state.files[fileKey];
-        const prevSid = prevCursor?.agent === adapter.id ? prevCursor.sessionId || '' : '';
-        const legacyIds = prevCursor?.agent === adapter.id ? collectLegacySessionIds(prevCursor) : [];
+        const prevSc = cursorScope(adapter.id, prevCursor);
+        const legacySc = prevCursor?.agent === adapter.id ? collectLegacyScopes(adapter.id, prevCursor) : [];
+        const itemSc = makeScope(adapter.id, item.sessionId, item.rolloutId || '');
         const effectiveCursor =
           prevCursor && prevCursor.agent && prevCursor.agent !== adapter.id ? null : prevCursor;
 
@@ -197,9 +286,9 @@ export function syncAllSources({ forceFullRescan = false, agents = null, dataDir
         if (!res) {
           failedFileKeys.add(fileKey);
           skippedFiles.push({ agent: adapter.id, filePath: item.filePath });
-          if (prevSid) failedSessionKeys.add(sessionKey(adapter.id, prevSid));
-          for (const lid of legacyIds) failedSessionKeys.add(sessionKey(adapter.id, lid));
-          if (item.sessionId) failedSessionKeys.add(sessionKey(adapter.id, item.sessionId));
+          addScope(failedScopes, prevSc);
+          for (const ls of legacySc) addScope(failedScopes, ls);
+          addScope(failedScopes, itemSc);
           return;
         }
         if (res.unchanged) return;
@@ -209,35 +298,32 @@ export function syncAllSources({ forceFullRescan = false, agents = null, dataDir
         state.files[fileKey] = res.cursor;
 
         const newSid = res.cursor.sessionId || item.sessionId;
+        const newRolloutId = res.cursor.rolloutId || item.rolloutId || '';
+        const newSc = makeScope(adapter.id, newSid, newRolloutId);
         const newSk = sessionKey(adapter.id, newSid);
+
+        const metaPatch = {
+          agent: adapter.id,
+          sessionId: newSid,
+          app: res.cursor.app || item.app || adapter.id,
+          title: res.cursor.title,
+          parentSessionId: res.cursor.parentSessionId || item.parentSessionId,
+          firstModel: res.cursor.firstModel,
+          lastModel: res.cursor.lastModel,
+          firstTs: res.cursor.firstTs,
+          lastTs: res.cursor.lastTs,
+        };
+
         if (itemForceFull) {
           fullScannedFileKeys.add(fileKey);
-          replaceSessionKeys.add(newSk);
-          if (prevSid) replaceSessionKeys.add(sessionKey(adapter.id, prevSid));
-          for (const lid of legacyIds) replaceSessionKeys.add(sessionKey(adapter.id, lid));
+          addScope(replaceScopes, newSc);
+          addScope(replaceScopes, prevSc);
+          for (const ls of legacySc) addScope(replaceScopes, ls);
           const list = rebuiltSessionMeta.get(newSk) || [];
-          list.push({
-            agent: adapter.id,
-            sessionId: newSid,
-            app: res.cursor.app || item.app || adapter.id,
-            title: res.cursor.title,
-            parentSessionId: res.cursor.parentSessionId || item.parentSessionId,
-            lastModel: res.cursor.lastModel,
-            firstTs: res.cursor.firstTs,
-            lastTs: res.cursor.lastTs,
-          });
+          list.push(metaPatch);
           rebuiltSessionMeta.set(newSk, list);
         } else {
-          mergeSessionMeta(state, {
-            agent: adapter.id,
-            sessionId: newSid,
-            app: res.cursor.app || item.app || adapter.id,
-            title: res.cursor.title,
-            parentSessionId: res.cursor.parentSessionId || item.parentSessionId,
-            lastModel: res.cursor.lastModel,
-            firstTs: res.cursor.firstTs,
-            lastTs: res.cursor.lastTs,
-          });
+          mergeSessionMeta(state, metaPatch);
         }
       };
 
@@ -245,30 +331,31 @@ export function syncAllSources({ forceFullRescan = false, agents = null, dataDir
         const { adapter, item } = entry;
         const fileKey = canonicalFileKey(item.filePath);
         const prevCursor = state.files[fileKey];
-        const prevSid = prevCursor?.agent === adapter.id ? prevCursor.sessionId || '' : '';
+        const prevSc = cursorScope(adapter.id, prevCursor);
+        const itemSc = makeScope(adapter.id, item.sessionId, item.rolloutId || '');
         const itemInUpgrade =
           !forceFullRescan &&
           (needsParserUpgrade(adapter, prevCursor) ||
-            (prevSid && upgradeSessionKeys.has(sessionKey(adapter.id, prevSid))) ||
-            (item.sessionId && upgradeSessionKeys.has(sessionKey(adapter.id, item.sessionId))));
+            (prevSc && upgradeScopes.has(scopeKey(prevSc))) ||
+            (itemSc && upgradeScopes.has(scopeKey(itemSc))));
         scanDiscoveredItem(entry, Boolean(forceFullRescan || itemInUpgrade));
       }
 
-      // Convergent closure: if an upgraded file resolved to a sessionId already shared by
-      // another live sibling file that wasn't full-scanned yet, rescan that sibling too so
-      // `replaceSessionKeys` never drops a live sibling's events.
-      if (!forceFullRescan && replaceSessionKeys.size > 0) {
+      // Convergent closure: if an upgraded file resolved into a namespace already shared by
+      // another live file that wasn't full-scanned yet, rescan that file too so `replaceScopes`
+      // never drops a live sibling's events.
+      if (!forceFullRescan && replaceScopes.size > 0) {
         let addedSibling = true;
         while (addedSibling) {
           addedSibling = false;
           for (const entry of discovered) {
             const fk = canonicalFileKey(entry.item.filePath);
             if (fullScannedFileKeys.has(fk) || failedFileKeys.has(fk)) continue;
-            const cur = state.files[fk];
-            const curSid = cur?.agent === entry.adapter.id ? cur.sessionId || '' : '';
+            const curSc = cursorScope(entry.adapter.id, state.files[fk]);
+            const itemSc = makeScope(entry.adapter.id, entry.item.sessionId, entry.item.rolloutId || '');
             const hitsReplaced =
-              (curSid && replaceSessionKeys.has(sessionKey(entry.adapter.id, curSid))) ||
-              (entry.item.sessionId && replaceSessionKeys.has(sessionKey(entry.adapter.id, entry.item.sessionId)));
+              (curSc && replaceScopes.has(scopeKey(curSc))) ||
+              (itemSc && replaceScopes.has(scopeKey(itemSc)));
             if (hitsReplaced) {
               addedSibling = true;
               scanDiscoveredItem(entry, true);
@@ -277,30 +364,42 @@ export function syncAllSources({ forceFullRescan = false, agents = null, dataDir
         }
       }
 
-      // Never purge persisted events for a session whose live file failed to read in this run,
-      // while still merging any fresh metadata recovered from healthy sibling files.
-      for (const fsk of failedSessionKeys) {
-        replaceSessionKeys.delete(fsk);
-        const metas = rebuiltSessionMeta.get(fsk);
-        if (metas && metas.length > 0) {
-          for (const m of metas) mergeSessionMeta(state, m);
-        }
-      }
-
-      // Refresh session metadata cleanly for fully rebuilt / upgraded sessions
-      for (const sk of replaceSessionKeys) {
-        const metas = rebuiltSessionMeta.get(sk);
-        if (metas && metas.length > 0) {
-          delete state.sessions[sk];
-          for (const m of metas) mergeSessionMeta(state, m);
-        } else {
-          // A previously misattributed sessionKey vacated during upgrade with zero remaining live files
-          delete state.sessions[sk];
-        }
+      // Never purge persisted events for any namespace whose live file failed to read in this run
+      const failedSessionKeys = new Set();
+      for (const [fKey, fScope] of failedScopes.entries()) {
+        replaceScopes.delete(fKey);
+        failedSessionKeys.add(sessionKey(fScope.agent, fScope.sessionId));
       }
 
       if (forceFullRescan || upgradedAny) {
-        compactEventsPreservingArchived(dataDir, newEvents, { replaceSessionKeys });
+        const { survivingSessionKeys } = compactEventsPreservingArchived(dataDir, newEvents, {
+          replaceScopes,
+        });
+
+        // Track which sessions had their primary (non-revert) scope replaced so stale pre-upgrade
+        // metadata on fully live sessions is refreshed, while sessions with deleted primary files
+        // retain their archived title / firstTs / firstModel via non-destructive merge.
+        const mainScopeReplaced = new Set();
+        const touchedSessions = new Set();
+        for (const s of replaceScopes.values()) {
+          const sk = sessionKey(s.agent, s.sessionId);
+          touchedSessions.add(sk);
+          if (!s.rolloutId) mainScopeReplaced.add(sk);
+        }
+
+        for (const [sk, metas] of rebuiltSessionMeta.entries()) {
+          if (mainScopeReplaced.has(sk) && !failedSessionKeys.has(sk)) {
+            delete state.sessions[sk];
+          }
+          for (const m of metas) mergeSessionMeta(state, m);
+        }
+
+        for (const sk of touchedSessions) {
+          if (!survivingSessionKeys.has(sk) && !rebuiltSessionMeta.has(sk)) {
+            delete state.sessions[sk];
+          }
+        }
+
         writeCursorsState(dataDir, state);
       } else if (changedFiles > 0) {
         if (newEvents.length) {

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 import * as zlib from 'node:zlib';
@@ -1392,5 +1392,396 @@ test('Codex v2.0.2 regressions: >256MiB .jsonl.zst streaming, skippedFiles repor
     }
   } finally {
     h.cleanup();
+  }
+});
+
+test('Codex v2.0.3 regressions: same-thread deleted sibling archive preservation, zero-duplicate hook-first upgrade, and stable firstModel backfill across model switches', () => {
+  // 1. Same-thread deleted main rollout preserved when revert sibling remains on disk (v2.0.3 --full AND v2.0.1 upgrade)
+  const h1 = createTestEnv('atm-codex-v203-sib-');
+  try {
+    const tId = '91919191-9191-9191-9191-919191919191';
+    const rId = '92929292-9292-9292-9292-929292929292';
+    const mainFile = h1.mkCodexRollout('2026/11/23', `rollout-2026-11-23T10-00-00-${tId}.jsonl`);
+    const revFile = h1.mkCodexRollout('2026/11/23', `rollout-2026-11-23T10-05-00-${tId}_${rId}.jsonl`);
+
+    writeFileSync(
+      mainFile,
+      [
+        JSON.stringify({ timestamp: '2026-11-23T10:00:00Z', type: 'session_meta', payload: { id: tId } }),
+        JSON.stringify({ timestamp: '2026-11-23T10:00:01Z', type: 'turn_context', payload: { model: 'gpt-6-sol' } }),
+        JSON.stringify({ timestamp: '2026-11-23T10:00:02Z', type: 'event_msg', payload: { type: 'user_message', message: 'Original Thread Title' } }),
+        JSON.stringify({
+          timestamp: '2026-11-23T10:00:03Z',
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 100, output_tokens: 20 } } },
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+    writeFileSync(
+      revFile,
+      [
+        JSON.stringify({ timestamp: '2026-11-23T10:05:00Z', type: 'session_meta', payload: { id: tId } }),
+        JSON.stringify({ timestamp: '2026-11-23T10:05:01Z', type: 'turn_context', payload: { model: 'gpt-6-sol' } }),
+        JSON.stringify({
+          timestamp: '2026-11-23T10:05:02Z',
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 200, output_tokens: 30 } } },
+        }),
+        JSON.stringify({
+          timestamp: '2026-11-23T10:05:03Z',
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 317, output_tokens: 50 } } },
+        }),
+      ].join('\n') + '\n',
+      'utf-8',
+    );
+
+    syncAllSources({ dataDir: h1.dataDir });
+    let rep = buildReport({ dataDir: h1.dataDir, rangeDays: 0, timeZone: 'UTC' });
+    assert.equal(rep.allTime.totalEvents, 3);
+    assert.equal(rep.period.total, 487);
+
+    // Delete original rollout, keep ONLY revert sibling -> sync --full MUST preserve all 3 steps / 487 tokens & title!
+    unlinkSync(mainFile);
+    syncAllSources({ dataDir: h1.dataDir, forceFullRescan: true });
+    rep = buildReport({ dataDir: h1.dataDir, rangeDays: 0, timeZone: 'UTC' });
+    assert.equal(rep.allTime.totalEvents, 3);
+    assert.equal(rep.period.total, 487);
+    assert.equal(rep.sessions.find((s) => s.sessionId === tId)?.title, 'Original Thread Title');
+
+    // Also test v2.0.1 ledger where original was deleted and ONLY revert remains -> hook-first syncSingleSource
+    // MUST immediately produce exact 3 steps / 487 tokens (zero temporary inflation in summary --no-sync)!
+    const h2 = createTestEnv('atm-codex-v203-hookupg-');
+    try {
+      const rev2 = h2.mkCodexRollout('2026/11/23', `rollout-2026-11-23T10-05-00-${tId}_${rId}.jsonl`);
+      writeFileSync(rev2, readFileSync(revFile, 'utf-8'), 'utf-8');
+      const revSt = statSync(rev2);
+      mkdirSync(join(h2.dataDir, 'events'), { recursive: true });
+      writeFileSync(
+        join(h2.dataDir, 'cursors.json'),
+        JSON.stringify(
+          {
+            version: 2,
+            files: {
+              [canonicalFileKey(rev2)]: {
+                agent: 'codex',
+                app: 'codex',
+                sessionId: rId,
+                size: revSt.size,
+                mtimeMs: revSt.mtimeMs,
+                ino: revSt.ino,
+                offset: revSt.size,
+                deltaSeq: 2,
+              },
+            },
+            sessions: {
+              [`codex:${tId}`]: { agent: 'codex', sessionId: tId, app: 'codex', title: 'Archived Main Title', lastModel: 'gpt-6-sol' },
+              [`codex:${rId}`]: { agent: 'codex', sessionId: rId, app: 'codex', lastModel: 'gpt-6-sol' },
+            },
+          },
+          null,
+          2,
+        ),
+        'utf-8',
+      );
+      writeFileSync(
+        join(h2.dataDir, 'events', '2026-11.jsonl'),
+        [
+          JSON.stringify({ a: 'codex', c: tId, e: 'tc:1', ts: Date.parse('2026-11-23T10:00:03Z'), m: 'gpt-6-sol', k: 'T', in: 100, cr: 0, cw5: 0, cw1h: 0, out: 20, r: 0 }),
+          JSON.stringify({ a: 'codex', c: rId, e: 'tc:1', ts: Date.parse('2026-11-23T10:05:02Z'), m: 'gpt-6-sol', k: 'T', in: 200, cr: 0, cw5: 0, cw1h: 0, out: 30, r: 0 }),
+          JSON.stringify({ a: 'codex', c: rId, e: 'tc:2', ts: Date.parse('2026-11-23T10:05:03Z'), m: 'gpt-6-sol', k: 'T', in: 117, cr: 0, cw5: 0, cw1h: 0, out: 20, r: 0 }),
+        ].join('\n') + '\n',
+        'utf-8',
+      );
+
+      // Run Hook (syncSingleSource) BEFORE global sync -> immediate exact result with no temporary 817-token spike!
+      syncSingleSource(rev2, { agent: 'codex', dataDir: h2.dataDir });
+      let rep2 = buildReport({ dataDir: h2.dataDir, rangeDays: 0, timeZone: 'UTC' });
+      assert.equal(rep2.allTime.totalEvents, 3);
+      assert.equal(rep2.period.total, 487);
+      assert.equal(rep2.sessions.length, 1);
+      assert.equal(rep2.sessions[0].sessionId, tId);
+      assert.equal(rep2.sessions[0].title, 'Archived Main Title');
+
+      // Subsequent normal sync and --full remain identical
+      syncAllSources({ dataDir: h2.dataDir });
+      syncAllSources({ dataDir: h2.dataDir, forceFullRescan: true });
+      rep2 = buildReport({ dataDir: h2.dataDir, rangeDays: 0, timeZone: 'UTC' });
+      assert.equal(rep2.allTime.totalEvents, 3);
+      assert.equal(rep2.period.total, 487);
+    } finally {
+      h2.cleanup();
+    }
+
+    // 2. Shared-scope v2.0.0 fork collision: hook-first syncSingleSource MUST defer without duplicating,
+    //    then syncAllSources cleanly upgrades both parent & child
+    const h3 = createTestEnv('atm-codex-v203-forkhook-');
+    try {
+      const pId = '93939393-9393-9393-9393-939393939393';
+      const cId = '94949494-9494-9494-9494-949494949494';
+      const pFile = h3.mkCodexRollout('2026/11/23', `rollout-2026-11-23T11-00-00-${pId}.jsonl`);
+      const cFile = h3.mkCodexRollout('2026/11/23', `rollout-2026-11-23T11-01-00-${cId}.jsonl`);
+      writeFileSync(
+        pFile,
+        [
+          JSON.stringify({ timestamp: '2026-11-23T11:00:00Z', type: 'session_meta', payload: { id: pId } }),
+          JSON.stringify({ timestamp: '2026-11-23T11:00:01Z', type: 'turn_context', payload: { model: 'gpt-6-luna' } }),
+          JSON.stringify({
+            timestamp: '2026-11-23T11:00:02Z',
+            type: 'event_msg',
+            payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 90, output_tokens: 10 } } },
+          }),
+        ].join('\n') + '\n',
+        'utf-8',
+      );
+      writeFileSync(
+        cFile,
+        [
+          JSON.stringify({ timestamp: '2026-11-23T11:01:00Z', type: 'session_meta', payload: { id: cId, forked_from_id: pId } }),
+          JSON.stringify({ timestamp: '2026-11-23T11:01:01Z', type: 'session_meta', payload: { id: pId } }),
+          JSON.stringify({ timestamp: '2026-11-23T11:01:02Z', type: 'turn_context', payload: { model: 'gpt-6-luna' } }),
+          JSON.stringify({
+            timestamp: '2026-11-23T11:01:03Z',
+            type: 'event_msg',
+            payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 200, output_tokens: 20 } } },
+          }),
+          JSON.stringify({
+            timestamp: '2026-11-23T11:01:04Z',
+            type: 'event_msg',
+            payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 290, output_tokens: 30 } } },
+          }),
+        ].join('\n') + '\n',
+        'utf-8',
+      );
+      const pSt = statSync(pFile);
+      const cSt = statSync(cFile);
+      mkdirSync(join(h3.dataDir, 'events'), { recursive: true });
+      writeFileSync(
+        join(h3.dataDir, 'cursors.json'),
+        JSON.stringify(
+          {
+            version: 2,
+            files: {
+              [canonicalFileKey(pFile)]: { agent: 'codex', app: 'codex', sessionId: pId, size: pSt.size, mtimeMs: pSt.mtimeMs, ino: pSt.ino, offset: pSt.size, deltaSeq: 1 },
+              [canonicalFileKey(cFile)]: { agent: 'codex', app: 'codex', sessionId: pId, size: cSt.size, mtimeMs: cSt.mtimeMs, ino: cSt.ino, offset: cSt.size, deltaSeq: 2 },
+            },
+            sessions: {
+              [`codex:${pId}`]: { agent: 'codex', sessionId: pId, app: 'codex', lastModel: 'gpt-6-luna' },
+            },
+          },
+          null,
+          2,
+        ),
+        'utf-8',
+      );
+      writeFileSync(
+        join(h3.dataDir, 'events', '2026-11.jsonl'),
+        [
+          JSON.stringify({ a: 'codex', c: pId, e: 'tc:1', ts: Date.parse('2026-11-23T11:01:03Z'), m: 'gpt-6-luna', k: 'T', in: 200, cr: 0, cw5: 0, cw1h: 0, out: 20, r: 0 }),
+          JSON.stringify({ a: 'codex', c: pId, e: 'tc:2', ts: Date.parse('2026-11-23T11:01:04Z'), m: 'gpt-6-luna', k: 'T', in: 90, cr: 0, cw5: 0, cw1h: 0, out: 10, r: 0 }),
+        ].join('\n') + '\n',
+        'utf-8',
+      );
+
+      const hookRes = syncSingleSource(cFile, { agent: 'codex', dataDir: h3.dataDir });
+      assert.equal(hookRes.deferredUpgrade, true);
+      // No temporary inflation before global sync
+      assert.equal(buildReport({ dataDir: h3.dataDir, rangeDays: 0, timeZone: 'UTC' }).allTime.totalEvents, 2);
+
+      // Next syncAllSources cleanly upgrades both parent and child
+      syncAllSources({ dataDir: h3.dataDir });
+      const rep3 = buildReport({ dataDir: h3.dataDir, rangeDays: 0, timeZone: 'UTC' });
+      assert.equal(rep3.allTime.totalEvents, 3);
+      assert.equal(rep3.period.total, 420);
+    } finally {
+      h3.cleanup();
+    }
+
+    // 3. Cross-batch pre-turn_context backfill MUST stay locked to firstModel after a later model switch
+    const h4 = createTestEnv('atm-codex-v203-firstmodel-');
+    try {
+      const mId = '95959595-9595-9595-9595-959595959595';
+      const mFile = h4.mkCodexRollout('2026/11/23', `rollout-2026-11-23T12-00-00-${mId}.jsonl`);
+
+      // Batch 1: token_count (120 tok) before any turn_context
+      writeFileSync(
+        mFile,
+        [
+          JSON.stringify({ timestamp: '2026-11-23T12:00:00Z', type: 'session_meta', payload: { id: mId } }),
+          JSON.stringify({
+            timestamp: '2026-11-23T12:00:01Z',
+            type: 'event_msg',
+            payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 100, output_tokens: 20 } } },
+          }),
+        ].join('\n') + '\n',
+        'utf-8',
+      );
+      syncAllSources({ dataDir: h4.dataDir });
+      assert.equal(buildReport({ dataDir: h4.dataDir, rangeDays: 0, timeZone: 'UTC' }).models[0].model, 'unknown');
+
+      // Batch 2: first turn_context arrives (`gpt-6-sol`) -> backfills Batch 1 directly in ledger
+      appendFileSync(
+        mFile,
+        JSON.stringify({ timestamp: '2026-11-23T12:00:05Z', type: 'turn_context', payload: { model: 'gpt-6-sol' } }) + '\n',
+        'utf-8',
+      );
+      syncAllSources({ dataDir: h4.dataDir });
+      let rep4 = buildReport({ dataDir: h4.dataDir, rangeDays: 0, timeZone: 'UTC' });
+      assert.equal(rep4.models.length, 1);
+      assert.equal(rep4.models[0].model, 'gpt-6-sol');
+      assert.equal(rep4.models[0].total, 120);
+
+      // Batch 3: switch model to `gpt-6.2-astra` + add 100 tok -> Batch 1 MUST stay `gpt-6-sol` (120) and Batch 3 is `gpt-6.2-astra` (100)!
+      appendFileSync(
+        mFile,
+        [
+          JSON.stringify({ timestamp: '2026-11-23T12:01:00Z', type: 'turn_context', payload: { model: 'gpt-6.2-astra' } }),
+          JSON.stringify({
+            timestamp: '2026-11-23T12:01:05Z',
+            type: 'event_msg',
+            payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 190, output_tokens: 30 } } },
+          }),
+        ].join('\n') + '\n',
+        'utf-8',
+      );
+      syncAllSources({ dataDir: h4.dataDir });
+      rep4 = buildReport({ dataDir: h4.dataDir, rangeDays: 0, timeZone: 'UTC' });
+      assert.equal(rep4.models.find((m) => m.model === 'gpt-6-sol')?.total, 120);
+      assert.equal(rep4.models.find((m) => m.model === 'gpt-6.2-astra')?.total, 100);
+
+      // Full rescan MUST match incremental breakdown identically
+      syncAllSources({ dataDir: h4.dataDir, forceFullRescan: true });
+      const rep4Full = buildReport({ dataDir: h4.dataDir, rangeDays: 0, timeZone: 'UTC' });
+      assert.equal(rep4Full.models.find((m) => m.model === 'gpt-6-sol')?.total, 120);
+      assert.equal(rep4Full.models.find((m) => m.model === 'gpt-6.2-astra')?.total, 100);
+    } finally {
+      h4.cleanup();
+    }
+
+    // 4. Red-team v2.0.3 closures:
+    //    (a) Timestamp-aware firstModel/lastModel across out-of-order multi-file thread scans + >128 in-batch unknown backfill
+    //    (b) Stale deleted-path cursor does not block syncSingleSource in-place upgrade
+    //    (c) tc -> ur 5ms handoff preserves rec.model to backfill unknown first step
+    const h5 = createTestEnv('atm-codex-v203-rt-');
+    try {
+      const mtId = '96969696-9696-9696-9696-969696969696';
+      const mrId = '97979797-9797-9797-9797-979797979797';
+      const lateRev = h5.mkCodexRollout('2026/11/23', `rollout-2026-11-23T12-00-00-${mtId}_${mrId}.jsonl`);
+      writeFileSync(
+        lateRev,
+        [
+          JSON.stringify({ timestamp: '2026-11-23T12:00:00Z', type: 'session_meta', payload: { id: mtId } }),
+          JSON.stringify({ timestamp: '2026-11-23T12:00:01Z', type: 'turn_context', payload: { model: 'gpt-6.2-astra' } }),
+          JSON.stringify({
+            timestamp: '2026-11-23T12:00:02Z',
+            type: 'event_msg',
+            payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 100, output_tokens: 10 } } },
+          }),
+        ].join('\n') + '\n',
+        'utf-8',
+      );
+      // Sync LATER revert file FIRST
+      syncSingleSource(lateRev, { agent: 'codex', dataDir: h5.dataDir });
+
+      // Now sync EARLIER main file containing 135 pre-turn_context unknown steps followed by gpt-6-sol
+      const earlyMain = h5.mkCodexRollout('2026/11/23', `rollout-2026-11-23T10-00-00-${mtId}.jsonl`);
+      const mainLines = [
+        JSON.stringify({ timestamp: '2026-11-23T10:00:00Z', type: 'session_meta', payload: { id: mtId } }),
+      ];
+      for (let i = 1; i <= 135; i++) {
+        mainLines.push(
+          JSON.stringify({
+            timestamp: new Date(Date.parse('2026-11-23T10:00:00Z') + i * 1000).toISOString(),
+            type: 'event_msg',
+            payload: { type: 'token_count', info: { total_token_usage: { input_tokens: i * 100, output_tokens: i * 10 } } },
+          }),
+        );
+      }
+      mainLines.push(
+        JSON.stringify({ timestamp: '2026-11-23T10:05:00Z', type: 'turn_context', payload: { model: 'gpt-6-sol' } }),
+      );
+      writeFileSync(earlyMain, mainLines.join('\n') + '\n', 'utf-8');
+      syncSingleSource(earlyMain, { agent: 'codex', dataDir: h5.dataDir });
+
+      const cur5 = JSON.parse(readFileSync(join(h5.dataDir, 'cursors.json'), 'utf-8'));
+      assert.equal(cur5.sessions[`codex:${mtId}`].firstModel, 'gpt-6-sol');
+      assert.equal(cur5.sessions[`codex:${mtId}`].lastModel, 'gpt-6.2-astra');
+      const diskEvents = readFileSync(join(h5.dataDir, 'events', '2026-11.jsonl'), 'utf-8')
+        .trim()
+        .split('\n')
+        .map((l) => JSON.parse(l));
+      assert.equal(diskEvents.filter((e) => e.m === 'unknown').length, 0);
+
+      // (b) Stale deleted-path cursor must NOT block syncSingleSource in-place upgrade
+      const stId = '98989898-9898-9898-9898-989898989898';
+      const srId = '99999999-9999-9999-9999-999999999999';
+      const liveZst = h5.mkCodexRollout('2026/11/23', `rollout-2026-11-23T13-00-00-${stId}_${srId}.jsonl.zst`);
+      const liveContent =
+        [
+          JSON.stringify({ timestamp: '2026-11-23T13:00:00Z', type: 'session_meta', payload: { id: stId } }),
+          JSON.stringify({ timestamp: '2026-11-23T13:00:01Z', type: 'turn_context', payload: { model: 'gpt-6-sol' } }),
+          JSON.stringify({
+            timestamp: '2026-11-23T13:00:02Z',
+            type: 'event_msg',
+            payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 3_000, output_tokens: 300 } } },
+          }),
+        ].join('\n') + '\n';
+      writeFileSync(liveZst, zlib.zstdCompressSync(Buffer.from(liveContent, 'utf-8')));
+      const liveSt = statSync(liveZst);
+      const deletedPlain = h5.mkCodexRollout('2026/11/23', `rollout-2026-11-23T13-00-00-${stId}_${srId}.jsonl`);
+      cur5.files[canonicalFileKey(deletedPlain)] = {
+        agent: 'codex',
+        app: 'codex',
+        sessionId: srId,
+        size: 100,
+        mtimeMs: 1000,
+        offset: 100,
+      };
+      cur5.files[canonicalFileKey(liveZst)] = {
+        agent: 'codex',
+        app: 'codex',
+        sessionId: srId,
+        size: liveSt.size,
+        mtimeMs: liveSt.mtimeMs,
+        ino: liveSt.ino,
+        offset: liveSt.size,
+      };
+      writeFileSync(join(h5.dataDir, 'cursors.json'), JSON.stringify(cur5, null, 2), 'utf-8');
+      const liveRes = syncSingleSource(liveZst, { agent: 'codex', dataDir: h5.dataDir });
+      assert.equal(liveRes.deferredUpgrade, undefined);
+      assert.equal(liveRes.added, 1);
+
+      // (c) tc -> ur 5ms handoff preserves rec.model to backfill unknown first step
+      const hId = '9a9a9a9a-9a9a-9a9a-9a9a-9a9a9a9a9a9a';
+      const hFile = h5.mkCodexRollout('2026/11/23', `rollout-2026-11-23T14-00-00-${hId}.jsonl`);
+      writeFileSync(
+        hFile,
+        [
+          JSON.stringify({ timestamp: '2026-11-23T14:00:00.000Z', type: 'session_meta', payload: { id: hId } }),
+          JSON.stringify({
+            timestamp: '2026-11-23T14:00:01.100Z',
+            type: 'event_msg',
+            payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 1_000, output_tokens: 100 } } },
+          }),
+          JSON.stringify({
+            timestamp: '2026-11-23T14:00:01.105Z',
+            type: 'event_msg',
+            payload: { type: 'token_usage_record', model: 'gpt-6-sol', response_id: 'r_m1', usage: { input_tokens: 1_000, output_tokens: 100 } },
+          }),
+        ].join('\n') + '\n',
+        'utf-8',
+      );
+      syncSingleSource(hFile, { agent: 'codex', dataDir: h5.dataDir });
+      const rep5 = buildReport({ dataDir: h5.dataDir, rangeDays: 0, timeZone: 'UTC' });
+      const hSess = rep5.sessions.find((s) => s.sessionId === hId);
+      assert.equal(hSess.steps, 1);
+      assert.equal(hSess.primaryModel, 'gpt-6-sol');
+      assert.equal(hSess.unpricedSteps, 0);
+    } finally {
+      h5.cleanup();
+    }
+  } finally {
+    h1.cleanup();
   }
 });

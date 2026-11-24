@@ -124,6 +124,7 @@ export function readCursorsState(dataDir = getDataDir()) {
       app: val.app || agent,
       title: val.title || '',
       parentSessionId: val.parentSessionId || val.parentConvId || '',
+      firstModel: val.firstModel || '',
       lastModel: val.lastModel || '',
       firstTs: Number(val.firstTs) || 0,
       lastTs: Number(val.lastTs) || 0,
@@ -141,20 +142,31 @@ export function writeCursorsState(dataDir, state) {
   });
 }
 
-export function mergeSessionMeta(state, { agent, sessionId, app, title, parentSessionId, lastModel, firstTs, lastTs }) {
+export function mergeSessionMeta(
+  state,
+  { agent, sessionId, app, title, parentSessionId, firstModel, lastModel, firstTs, lastTs },
+) {
   const sk = sessionKey(agent, sessionId);
   const prev = state.sessions[sk] || {};
   const nextFirst =
     firstTs && prev.firstTs ? Math.min(firstTs, prev.firstTs) : firstTs || prev.firstTs || 0;
+  const nextLast = Math.max(lastTs || 0, prev.lastTs || 0);
+  const useIncomingFirstModel =
+    Boolean(firstModel) &&
+    (!prev.firstModel || (Boolean(firstTs) && (!prev.firstTs || firstTs < prev.firstTs)));
+  const useIncomingLastModel =
+    Boolean(lastModel) &&
+    (!prev.lastModel || !prev.lastTs || (Boolean(lastTs) && lastTs >= prev.lastTs));
   state.sessions[sk] = {
     agent,
     sessionId,
     app: app || prev.app || agent,
     title: title || prev.title || '',
     parentSessionId: parentSessionId || prev.parentSessionId || '',
-    lastModel: lastModel || prev.lastModel || '',
+    firstModel: useIncomingFirstModel ? firstModel : prev.firstModel || '',
+    lastModel: useIncomingLastModel ? lastModel : prev.lastModel || '',
     firstTs: nextFirst,
-    lastTs: Math.max(lastTs || 0, prev.lastTs || 0),
+    lastTs: nextLast,
   };
 }
 
@@ -179,16 +191,26 @@ export function appendEventsByMonth(dataDir, events) {
   }
 }
 
+function matchesReplaceScope(e, scope) {
+  if (e.a !== scope.agent || e.c !== scope.sessionId) return false;
+  if (e.a !== 'codex') return true;
+  if (scope.rolloutId) {
+    return e.e.startsWith(`rev:${scope.rolloutId}:`);
+  }
+  return !e.e.startsWith('rev:');
+}
+
 /**
- * Full-rescan / upgrade compaction that preserves archived events from deleted transcripts,
- * replaces events for explicitly refreshed live sessions (`replaceSessionKeys`),
- * overwrites matching keys with rebuilt events, and removes orphaned empty month files
- * left behind when an event moves across a month boundary.
+ * Full-rescan / upgrade compaction that preserves archived events from deleted transcripts
+ * (including deleted sibling rollouts sharing a Codex thread ID), replaces events only for
+ * explicitly targeted file namespaces (`replaceScopes`) or sessions (`replaceSessionKeys`),
+ * overwrites matching keys with rebuilt events, and removes orphaned empty month files.
+ * Returns `{ survivingSessionKeys: Set<string> }`.
  */
 export function compactEventsPreservingArchived(
   dataDir,
   rebuiltEvents,
-  { replaceSessionKeys = null } = {},
+  { replaceSessionKeys = null, replaceScopes = null } = {},
 ) {
   const dir = eventsDir(dataDir);
   mkdirSync(dir, { recursive: true });
@@ -201,11 +223,30 @@ export function compactEventsPreservingArchived(
       : Array.isArray(replaceSessionKeys)
         ? new Set(replaceSessionKeys)
         : null;
+  const scopesBySession = new Map();
+  if (replaceScopes) {
+    const iterable = replaceScopes instanceof Map ? replaceScopes.values() : replaceScopes;
+    for (const s of iterable) {
+      if (!s || !s.agent || !s.sessionId) continue;
+      const sk = sessionKey(s.agent, s.sessionId);
+      let list = scopesBySession.get(sk);
+      if (!list) {
+        list = [];
+        scopesBySession.set(sk, list);
+      }
+      list.push(s);
+    }
+  }
   const merged = new Map();
 
   for (const file of existingFiles) {
     for (const e of parseMonthFile(join(dir, file))) {
-      if (replaceSet && replaceSet.has(sessionKey(e.a, e.c))) {
+      const sk = sessionKey(e.a, e.c);
+      if (replaceSet && replaceSet.has(sk)) {
+        continue;
+      }
+      const scopes = scopesBySession.get(sk);
+      if (scopes && scopes.some((s) => matchesReplaceScope(e, s))) {
         continue;
       }
       merged.set(eventKey(e), e);
@@ -217,8 +258,10 @@ export function compactEventsPreservingArchived(
     if (e) merged.set(eventKey(e), e);
   }
 
+  const survivingSessionKeys = new Set();
   const byMonth = new Map();
   for (const e of merged.values()) {
+    survivingSessionKeys.add(sessionKey(e.a, e.c));
     const month = new Date(e.ts).toISOString().slice(0, 7);
     let bucket = byMonth.get(month);
     if (!bucket) {
@@ -248,6 +291,8 @@ export function compactEventsPreservingArchived(
       monthFileCache.delete(stalePath);
     }
   }
+
+  return { survivingSessionKeys };
 }
 
 // Per-file parsed cache keyed by `mtimeMs:size:ino`

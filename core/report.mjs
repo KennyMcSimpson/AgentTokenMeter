@@ -174,15 +174,19 @@ export function buildReport({
   }
 
   // Inherit session/parent model for unknown events:
-  // - Codex: backfill pre-`turn_context` unknown events once the session's `lastModel` arrives in a later scan
+  // - Codex: backfill pre-`turn_context` unknown events using the session's `firstModel`
+  //   (falling back to `lastModel` only for older cursors that predate `firstModel`)
   // - Antigravity: inherit parent model for legacy pre-Nov-19 subagents via `parentSessionId` chain
   const inheritedModelCache = new Map();
   const resolveEventModel = (evAgent, sid, rawModel) => {
     const norm = normalizeModel(rawModel);
     if (norm !== 'unknown') return norm;
     if (evAgent === 'codex') {
-      const sm = normalizeModel(sessions[sessionKey(evAgent, sid)]?.lastModel);
-      return sm !== 'unknown' ? sm : 'unknown';
+      const sMeta = sessions[sessionKey(evAgent, sid)];
+      const fm = normalizeModel(sMeta?.firstModel);
+      if (fm !== 'unknown') return fm;
+      const lm = normalizeModel(sMeta?.lastModel);
+      return lm !== 'unknown' ? lm : 'unknown';
     }
     if (evAgent !== 'antigravity') return norm;
     const cacheKey = sessionKey(evAgent, sid);

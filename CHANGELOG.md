@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.3 — File-Namespace Archive Preservation, Zero-Duplicate Hook Upgrades & Locked First-Model Backfill
+
+### Fixed
+- **Same-Thread Archived Sibling Preservation**: Scoped ledger replacement in `compactEventsPreservingArchived` and `core/sync.mjs` to file-level namespaces `(agent, sessionId, rolloutId)`, so deleting an original Codex rollout while keeping its `<threadId>_<rolloutId>` revert sibling (or vice versa) preserves the deleted file's archived events across both upgrades and `sync --full`.
+- **Zero Temporary Double-Counting on Hook-First Legacy Upgrades**: When `syncSingleSource` upgrades an isolated legacy file (no sibling sharing the legacy namespace), it now atomically compacts that namespace immediately so `summary --no-sync` stays exact; when a sibling shares the legacy namespace (e.g. v2.0.0 fork collision) or under fast `statusline` lock budgets, it defers without appending duplicate events until the next `syncAllSources()`.
+- **Stable Cross-Batch Codex Model Backfill**: Persisted `pendingUnknownEvents` in Codex file cursors to rewrite earlier `unknown` events directly in the ledger (LWW) as soon as the first `turn_context` arrives, and recorded immutable `firstModel` in session metadata so later mid-session model switches never retroactively rewrite earlier turns.
+- **Consistent OpenAI Cache-Write Rate Policy**: Unified `gpt-5.5` with `gpt-5.4` at `1.0x` input rate for cache writes (neither has published separate cache-write rates on OpenAI docs), while retaining official `1.25x` / `2.5x` rates on GPT-6.x and GPT-5.6 models and explicitly noting estimated `>272K` long-context cache-write scaling in `tierNote`.
+
 ## 2.0.2 — Large `.jsonl.zst` Streaming, Native Revert Filenames, Seamless Ledger Upgrades & Rate Accuracy
 
 ### Fixed
